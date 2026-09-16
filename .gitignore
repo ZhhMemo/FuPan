@@ -1,0 +1,42 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── 数据大文件（禁止入库；只提交代码/DDL/脚本/配置）──
+*.duckdb
+*.duckdb.wal
+*.duckdb.write.lock
+*.parquet
+*.csv.gz
+*.feather
+data/raw/
+data/clean/
+data/app/
+*.log
+
+# ── 环境与密钥 ──
+.env
+.env.local
+*.pem
+*.key
+
+# ── Node / 前端 ──
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# ── 工具与系统 ──
+.DS_Store
+.idea/
+.vscode/

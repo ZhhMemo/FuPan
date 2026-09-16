@@ -1,0 +1,238 @@
+classDiagram
+    direction LR
+
+    %% ── 基础设施 ──
+    class DuckDBManager {
+        +market_conn
+        +app_conn
+        +lock : FileLock
+        +get_read(layer) Connection
+        +get_write(layer) Connection
+        +acquire_write(layer)
+    }
+
+    %% ── 数据访问层 ──
+    class Repository {
+        +get_daily(code, start, end) DataFrame
+        +get_minute(code, start, end) DataFrame
+        +get_calendar(start, end) DataFrame
+        +get_index_daily(index_code, start, end) DataFrame
+        +get_limit(code, date) Limit
+        +get_dividend(code, start, end) DataFrame
+        +get_stock(code) Stock
+        +list_stocks() DataFrame
+        +get_question(qid) Question
+        +get_order(oid) Order
+    }
+    class VisibilityGuard {
+        +cutoff : datetime
+        +mask(df) DataFrame
+        +mask_by_col(df, col) DataFrame
+        +assert_no_future(df)
+    }
+    class PriceAdjuster {
+        +adjust(df, mode) DataFrame
+        +factor(code, date) float
+    }
+    class UniverseProvider {
+        +as_of(date) List~Stock~
+    }
+    class SyncService {
+        +ingest_meta()
+        +ingest_daily(full)
+        +ingest_minute(codes, resume)
+        +precompute_limit()
+        +sync_daily()
+    }
+    class Checkpoint {
+        +last_date_of(code) date
+        +mark(code, date)
+        +failed_list() List~str~
+    }
+    class HealthCheck {
+        +run() Report
+    }
+
+    %% ── 引擎 ──
+    class CostModel {
+        +commission_rate
+        +stamp_tax_rate
+        +transfer_fee_rate
+        +slippage_rate
+        +calc(side, price, shares) FeeDetail
+    }
+    class TradeRuleEngine {
+        +can_buy(bar) bool
+        +can_sell(bar, position) bool
+        +is_suspended(bar) bool
+        +limit_prices(code, date, prev_close) Limit
+        +next_tradable(date, side) date
+    }
+    class Position {
+        +shares : int
+        +available_shares : int
+        +avg_cost : float
+        +market_value(price) float
+    }
+    class Account {
+        +cash : float
+        +position : Position
+        +total_asset(price) float
+    }
+    class TradeEngine {
+        +place_order(order, bar) Order
+        +fill(order, bar, cost, rules) Fill
+        +apply_dividend(div, position, account)
+        +nav(account, price) float
+    }
+    class SettlementEngine {
+        +settle(order, question, snapshot) Settlement
+    }
+    class SnapshotFreezer {
+        +freeze(order, adj_factor, fee_version) ParamsSnapshot
+    }
+    class AdviceEngine {
+        +rule_version : str
+        +advise(df) Advice
+    }
+
+    %% ── 知识点 ──
+    class FeatureBuilder {
+        +build(slice) DataFrame
+    }
+    class DSLEvaluator {
+        +eval(rule, features) bool
+    }
+    class Detector {
+        <<abstract>>
+        +detect(ohlcv_slice) List~Occurrence~
+    }
+    class PointDetector {
+        +detect(slice)
+    }
+    class PersistentDetector {
+        +detect(slice)
+    }
+    class KnowledgeMatcher {
+        +match(slice, kb_list) List~Match~
+        +precompute_all()
+    }
+    class SeverityScorer {
+        +score(match, ctx) float
+    }
+
+    %% ── 出题 ──
+    class Segmenter {
+        +segment(code) List~Interval~
+    }
+    class QuestionBuilder {
+        +build(interval) Question
+        +gen_initial_position(kind, price) InitialPosition
+    }
+
+    %% ── 回放 ──
+    class ReplayClock {
+        +current_dt : datetime
+        +advance(n) datetime
+    }
+    class SessionStore {
+        +create(session)
+        +load(sid) Session
+        +save(session)
+    }
+    class ReplayEngine {
+        +create_session(cfg) Session
+        +advance(sid, n) Bars
+        +order(sid, side, shares) Fill
+        +nav(sid) float
+    }
+    class DividendAdjuster {
+        +on_cross_ex_date(session, code)
+    }
+
+    %% ── AI ──
+    class LLMProvider {
+        <<interface>>
+        +chat(messages, schema) dict
+    }
+    class DeepSeekProvider {
+        +chat(messages, schema) dict
+    }
+
+    %% ── 数据模型 ──
+    class Stock {
+        +code : str
+        +name : str
+        +list_date : date
+        +delist_date : date
+        +board : str
+        +industry : str
+        +is_st : bool
+    }
+    class Question {
+        +question_id : str
+        +code : str
+        +start_date : date
+        +end_date : date
+        +pattern_tag : str
+        +position_type : str
+        +initial_position : InitialPosition
+        +initial_cash : float
+        +settle_params : dict
+        +visible_until : date
+    }
+    class Order {
+        +order_id : str
+        +question_id : str
+        +session_id : str
+        +dt : datetime
+        +side : str
+        +shares : int
+        +params_snapshot : dict
+    }
+    class Settlement {
+        +order_id : str
+        +account_return : float
+        +stock_return : float
+        +benchmark_return : float
+        +alpha : float
+        +opp_cost : float
+        +max_dd : float
+    }
+
+    %% ── 关系 ──
+    Repository --> DuckDBManager : uses
+    VisibilityGuard ..> Repository : wraps output
+    PriceAdjuster ..> Repository : post-process
+    UniverseProvider --> Repository : uses
+    SyncService --> Repository : writes via
+    SyncService --> Checkpoint : uses
+    SyncService --> HealthCheck : runs
+
+    TradeEngine --> CostModel : uses
+    TradeEngine --> TradeRuleEngine : uses
+    TradeEngine --> Account : mutates
+    Account *-- Position
+    SettlementEngine --> TradeEngine : reuses
+    SettlementEngine --> SnapshotFreezer : uses
+    AdviceEngine --> Repository : reads (masked)
+
+    KnowledgeMatcher --> Detector : dispatches
+    Detector <|-- PointDetector
+    Detector <|-- PersistentDetector
+    PointDetector --> DSLEvaluator : uses
+    PersistentDetector --> DSLEvaluator : uses
+    Detector --> FeatureBuilder : uses
+    KnowledgeMatcher --> SeverityScorer : uses
+
+    QuestionBuilder --> Segmenter : uses
+    QuestionBuilder ..> Question : creates
+
+    ReplayEngine --> ReplayClock : uses
+    ReplayEngine --> TradeEngine : reuses
+    ReplayEngine --> SessionStore : persists
+    ReplayEngine --> DividendAdjuster : uses
+
+    DeepSeekProvider ..|> LLMProvider : implements
+    Order ..> Question : for
+    Settlement ..> Order : for

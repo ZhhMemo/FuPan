@@ -1,0 +1,156 @@
+%% ============================================================
+%% 复盘 · 关键流程时序图（共 3 张）
+%% ============================================================
+
+%% ── 图 1：判断模式「观察 → 下单 → 结算 → 知识点匹配」 ──
+sequenceDiagram
+    autonumber
+    participant FE as 前端(React)
+    participant API as FastAPI
+    participant VG as VisibilityGuard
+    participant REPO as Repository
+    participant TE as TradeEngine
+    participant SE as SettlementEngine
+    participant SF as SnapshotFreezer
+    participant KM as KnowledgeMatcher
+
+    Note over FE,API: ① 出题（M1 手工 / M2 抽取）
+    FE->>API: POST /questions/custom {code,start,end,position_type}
+    API->>REPO: 写入 dim_question（visible_until=end_date）
+    API-->>FE: Question
+
+    Note over FE,REPO: ② 观察（严格截断）
+    FE->>API: GET /questions/{qid}/kline?adjust=qfq
+    API->>REPO: get_daily(code, from, end_date)
+    API->>VG: mask(df, cutoff=end_date)  %% 红线①
+    API->>API: PriceAdjuster.adjust(df, QFQ) + 指标截断
+    API-->>FE: bars(max date<=end_date) + 指标
+
+    Note over FE,TE: ③ 下单（落快照）
+    FE->>API: POST /trade/order {side, shares}
+    API->>SF: freeze(费率版本, adj_factor, 成交价)
+    API->>TE: place_order(order, snapshot)
+    TE-->>API: order_id
+    API->>REPO: 写 fact_order(params_snapshot)
+    API-->>FE: {order_id}
+
+    Note over FE,SE: ④ 结算（独立延后接口）
+    FE->>API: POST /settle/{qid}
+    API->>REPO: get_daily(T+1..T+window) + 指数 + 快照
+    API->>SE: settle(order, question, snapshot)   %% 只用快照，不读当前因子
+    SE->>TE: 复算 持仓/现金/净值（复权 HFQ）
+    SE-->>API: 账户收益率/超额/机会成本/最大回撤
+    API->>REPO: 写 fact_settlement（冻结）
+    API-->>FE: Settlement
+
+    Note over API,KM: ⑤ 知识点匹配（下单后才跑）
+    API->>KM: match(slice, kb_list)  %% 复用 detector 纯函数
+    KM-->>API: 命中+显著性（分层）
+    FE->>API: GET /knowledge/matches/{qid}
+    API-->>FE: 分层知识点卡片
+
+%% ── 图 1.1：判卷模式（判断模式分支，M1-T6） ──
+sequenceDiagram
+    autonumber
+    participant FE as 前端
+    participant API as FastAPI
+    participant VG as VisibilityGuard
+    participant ADV as AdviceEngine
+    participant REPO as Repository
+    participant TE as TradeEngine
+    participant SE as SettlementEngine
+
+    Note over FE,API: ① 出题时标注 question_mode=judge
+    FE->>API: POST /questions/custom {..., question_mode:"judge"}
+
+    Note over FE,ADV: ② 模型建议（只在决策点前算）
+    FE->>API: GET /questions/{qid}/advice
+    API->>REPO: get_daily(code, from, end_date)
+    API->>VG: mask(df, cutoff=end_date)   %% 红线①
+    API->>ADV: advise(df)   %% MA20 方向 → 三档仓位
+    ADV-->>API: {tier, target_position, reason_text, rule_version}
+    API-->>FE: 模型建议（含单句可解释理由）
+
+    Note over FE,TE: ③ 用户评判 + 下单（下单制不变）
+    FE->>API: POST /trade/order {side, shares, judge_verdict:agree|disagree}
+    API->>TE: place_order(order, snapshot)   %% 共用同一 TradeEngine
+    TE-->>API: order_id（judge_advice 快照落库）
+    API-->>FE: {order_id}
+
+    Note over FE,SE: ④ 结算（与判断模式完全一致）
+    FE->>API: POST /settle/{qid}
+    API->>SE: settle(order, question, snapshot)
+    SE-->>API: 账户结果（按用户实际下单结算，不判对错）
+    API-->>FE: Settlement + 采纳度（用于 FR-6.5 模式分账）
+
+%% ── 图 2：回放模式「advance → 除权 → 下单 → 下一格成交」 ──
+sequenceDiagram
+    autonumber
+    participant FE as 前端
+    participant API as FastAPI
+    participant RC as ReplayClock
+    participant RE as ReplayEngine
+    participant DA as DividendAdjuster
+    participant REPO as Repository
+    participant TE as TradeEngine
+    participant SS as SessionStore
+
+    Note over FE,SS: ① 建会话 / 恢复
+    FE->>API: POST /replay/sessions {mode,code,start,granularity,initial_cash}
+    API->>SS: create(sim_session); 写 sim_position(initial)
+    SS-->>FE: Session
+
+    Note over FE,RE: ② 推进（只能前进）
+    FE->>API: POST /replay/sessions/{sid}/advance {n}
+    API->>RC: advance(n)   %% 无 set_time(t)
+    RC->>REPO: get_minute(code, current_dt, +n格)
+    RC->>DA: 检查是否跨除权日
+    DA->>TE: apply_dividend(送股→股数, 分红→现金)（红线②/FR-9.12）
+    RC->>SS: 更新 current_dt + sim_nav
+    RC-->>API: {current_dt, bars(dt<=current_dt)}
+    API-->>FE: 推进结果（当日分时只到当前格）
+
+    Note over FE,TE: ③ 下单（成交取下一格）
+    FE->>API: POST /replay/sessions/{sid}/order {side,shares}
+    API->>RE: order(sid, side, shares)
+    RE->>REPO: get_minute(code, next_bar = current_dt+granularity)
+    RE->>TE: fill(order, next_bar, cost, rules)  %% 红线③⑤
+    TE-->>RE: Fill / 顺延(一字板/停牌)
+    RE->>SS: 写 sim_trade + sim_position + sim_nav
+    RE-->>API: Fill
+    API-->>FE: 持仓/现金/净值更新
+
+    Note over FE,API: ④ 结束
+    FE->>API: POST /replay/sessions/{sid}/finish
+    API-->>FE: Report（净值曲线/交易统计/对比沪深300）
+
+%% ── 图 3：每日数据同步（21:00 北京时间，进程内定时） ──
+sequenceDiagram
+    autonumber
+    participant CRON as APScheduler(API进程内, Asia/Shanghai 21:00)
+    participant SYNC as daily_sync
+    participant LOCK as filelock
+    participant BS as Baostock
+    participant DB as market.duckdb(写)
+    participant CK as Checkpoint/失败清单
+    participant HC as HealthCheck
+
+    CRON->>SYNC: 触发增量同步（也可手动 /admin/sync/daily）
+    SYNC->>LOCK: acquire_write(market)
+    alt 拿到锁
+        LOCK-->>SYNC: OK
+        SYNC->>BS: login + query 当日日K
+        BS-->>SYNC: 日K数据
+        SYNC->>DB: raw 落盘 → clean(fact_daily upsert)
+        SYNC->>BS: query 当日 分钟K（5/15/30/60）
+        SYNC->>DB: fact_minute upsert
+        SYNC->>DB: 更新 dim_limit / dim_index_daily / dim_dividend
+        SYNC->>CK: 记录每只成功股票；失败写入 sync_failure
+        SYNC->>HC: run() 校验（股票数突变/日期跳跃/价格非负非零/涨跌幅超限）
+        HC-->>SYNC: 异常清单（有异常则告警，不留歧义）
+        SYNC->>LOCK: release
+    else 拿不到锁
+        LOCK-->>SYNC: 拒绝
+        SYNC-->>CRON: 明确失败（不静默）
+    end
+    SYNC-->>CRON: 完成（失败清单次日重试）

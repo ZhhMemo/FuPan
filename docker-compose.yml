@@ -1,0 +1,39 @@
+# 复盘 · 云服务器一键起服务（nginx + api）
+# 说明：M0 阶段仅提供骨架；nginx 反代提供全站 HTTPS（证书挂载到 ./deploy/certs）。
+services:
+  api:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    image: fupan-api:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      FUPAN_DATA_ROOT: /data/fupan
+      FUPAN_MARKET_READONLY: "0"
+    volumes:
+      - fupan-data:/data/fupan
+    expose:
+      - "8000"
+    command: >
+      gunicorn app.main:app
+      -k uvicorn.workers.UvicornWorker
+      -w 1
+      -b 0.0.0.0:8000
+    working_dir: /app/backend
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/certs:/etc/nginx/certs:ro
+
+volumes:
+  fupan-data:
