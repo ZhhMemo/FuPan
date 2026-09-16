@@ -65,6 +65,12 @@ make sync
 make health
 ```
 
+> **`akshare` 为可选依赖**：它是「按需补充」数据源（绝不做定时任务），
+> 且其依赖 `jsonpath` 仅以 sdist 发布，在部分环境无法安装。
+> 因此归入独立 extra，核心依赖（Baostock）不受影响。如需：
+> `pip install -e ".[akshare]"`（或 `.[dev,akshare]`）。缺失时
+> `AkshareClient` 会惰性导入并抛出明确的 `DataUnavailable`。
+
 ## 关键约定
 
 - **时区**：全系统 `Asia/Shanghai`（`config.TZ`），调度器显式传时区。
