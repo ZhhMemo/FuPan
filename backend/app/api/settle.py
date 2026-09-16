@@ -48,12 +48,14 @@ def settle(
     account = build_account_after_orders(repo, engine, rec)
 
     settlement_engine = SettlementEngine(repo, trade_engine=engine)
+    # 只用快照结算（红线④）：传入 orders 仅作「快照未冻结账户」时的兜底（按冻结费率回放）
     result = settlement_engine.settle(
         order,
         rec,
         snapshot=snap,
         account=account,
         window=(payload.window if payload else None),
+        orders=orders,
     )
 
     # 持久化（冻结）

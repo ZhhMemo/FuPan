@@ -148,6 +148,28 @@ def round_to_cent(value: float | Decimal | None) -> float | None:
     return float(d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
+def limit_prices_of(prev_close: float | Decimal, pct: float | Decimal) -> tuple[float, float]:
+    """按涨跌幅比例计算 ``(涨停价, 跌停价)`` —— **唯一实现（Decimal 精确 + HALF_UP 到分）**。
+
+    与普通 ``round_to_cent(prev × (1 ± pct))`` 的区别（**必须**用本函数，勿自行实现）：
+    浮点乘法会把「半分位」压成低一分（例如 ``27.65 × 0.9 = 24.884999…`` → 24.88），
+    而真实规则是 ``24.885 → 24.89``（已被真实行情证伪：sz.300104 2013-03-28 当日最低价 24.89）。
+    因此先用 ``Decimal`` 完成 ``(1 ± pct)`` 乘法，再 ``quantize(0.01, ROUND_HALF_UP)``。
+
+    Args:
+        prev_close: 前收盘价（不复权）。
+        pct: 涨跌幅比例（如 ``0.10``）。
+
+    Returns:
+        ``(limit_up, limit_down)``，均为两位小数。
+    """
+    pc = prev_close if isinstance(prev_close, Decimal) else Decimal(str(prev_close))
+    r = pct if isinstance(pct, Decimal) else Decimal(str(pct))
+    up = (pc * (Decimal(1) + r)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    down = (pc * (Decimal(1) - r)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return float(up), float(down)
+
+
 # ══════════════════ 基础信息 ══════════════════
 @dataclass(slots=True)
 class Stock:
@@ -418,6 +440,7 @@ __all__ = [
     "BSE_LIMIT_30PCT_START",
     "board_of",
     "limit_pct_of",
+    "limit_prices_of",
     "round_to_cent",
     "Stock",
     "DailyBar",

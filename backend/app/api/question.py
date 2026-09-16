@@ -195,17 +195,30 @@ def get_kline(
     qid: str,
     adjust: str = Query(default="qfq", pattern="^(qfq|hfq|none)$"),
     indicators: str = Query(default="ma"),
+    from_date: date | None = Query(default=None, alias="from"),
+    to_date: date | None = Query(default=None, alias="to"),
     username: str = Depends(get_current_user),
 ) -> dict[str, Any]:
-    """K 线数据（前/后/不复权），**严格截断于决策点**（红线①）。"""
+    """K 线数据（前/后/不复权），**严格截断于决策点**（红线①）。
+
+    支持 ``from`` / ``to`` 区间裁剪（``06`` §8.2）：实际窗口 = ``[start_date, end_date]``
+    ∩ ``[from, to]``；``to`` **不得越过决策点**——无论 ``from/to`` 如何传，
+    一律再过一次 ``VisibilityGuard``（cutoff = ``end_date``），不会泄漏决策点后数据。
+    """
     repo = Repository()
     rec = _load_question(repo, qid)
     code = rec["code"]
     end_date = pd.Timestamp(rec["end_date"]).date()
     start_date = pd.Timestamp(rec["start_date"]).date()
 
-    raw = repo.get_daily(code, start=start_date, end=end_date)
-    masked = mask_df(raw, end_date, "date")  # 红线①
+    # 区间裁剪：与题目可见窗口求交；且 clip 到决策点，杜绝越界
+    lo = max(start_date, from_date) if from_date is not None else start_date
+    hi = min(end_date, to_date) if to_date is not None else end_date
+    if hi < lo:
+        raise ValidationError(f"K 线区间为空：from={lo} 晚于 to={hi}")
+
+    raw = repo.get_daily(code, start=lo, end=hi)
+    masked = mask_df(raw, end_date, "date")  # 红线①：cutoff 恒为决策点
     if masked is None or masked.empty:
         raise NotFound("该区间无可见行情数据")
 

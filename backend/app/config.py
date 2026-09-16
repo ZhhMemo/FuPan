@@ -59,7 +59,14 @@ class Settings(BaseSettings):
     min_commission: float = 5.0  # 最低 5 元
     stamp_tax_rate: float = 5e-4  # 印花税 0.05%（卖出）
     transfer_fee_rate: float = 1e-5  # 过户费 0.001%（双向）
+    regulation_fee_rate: float = 0.0  # 规费（经手费+证管费）：设计口径「含在全佣内」，单列仅用于费率族快照留痕/审计
     slippage_rate: float = 5e-4  # 滑点 0.05%（双向）
+
+    # ── 成交口径（FR-4.8：成交价可配置，默认 T+1 开盘价）──
+    # 取值：``t1_open``（默认，最接近真实散户）/ ``t1_close`` / ``t0_close``。
+    fill_price_source: str = "t1_open"
+    # 「开盘即封板」保守规则（`00` §7 规则#4）：``开盘价 == 涨停价`` → 视为无法买入（可配置开关）。
+    open_seal_no_buy: bool = True
 
     # ── 定时同步 ──
     sync_hour: int = 21
@@ -67,6 +74,10 @@ class Settings(BaseSettings):
 
     # ── 结算 ──
     settle_window: int = 20  # 决策点后观察 N 个交易日再结算（默认 20）
+
+    # ── 训练数据备份（FR-8.7，P0：app.duckdb 不可再生）──
+    backup_dir: str = "backups"  # 相对 data_root 的备份目录名（禁止入库）
+    backup_keep: int = 14  # 保留最近 N 份备份（滚动清理）
 
     # ── 数据源 ──
     full_history_start: str = "1990-12-19"
@@ -118,6 +129,11 @@ class Settings(BaseSettings):
         return self.data_root / "app"
 
     @property
+    def backup_path(self) -> Path:
+        """训练数据备份目录（FR-8.7；禁止入库）。"""
+        return self.data_root / self.backup_dir
+
+    @property
     def market_lock(self) -> Path:
         return self.data_root / "market.duckdb.write.lock"
 
@@ -127,7 +143,7 @@ class Settings(BaseSettings):
 
     def ensure_dirs(self) -> None:
         """创建所有必需的目录（幂等）。"""
-        for d in (self.data_root, self.raw_dir, self.clean_dir, self.app_parquet_dir):
+        for d in (self.data_root, self.raw_dir, self.clean_dir, self.app_parquet_dir, self.backup_path):
             d.mkdir(parents=True, exist_ok=True)
 
 

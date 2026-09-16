@@ -3,15 +3,18 @@
 约定（对齐设计 §21「成本模型」）：
 - 唯一实现本模块；费率全部**可配置**并携带 ``fee_version``；
 - 默认值：佣金 万2.5 最低 5 元（双向）、印花税 0.05%（**仅卖出**）、
-  过户费 0.001%（双向）、滑点 0.05% 双向；**规费含在全佣内**；
+  过户费 0.001%（双向）、滑点 0.05% 双向；**规费含在全佣内**（``regulation_fee_rate`` 单列留痕，默认 0）；
 - **禁止硬编码费率**（一律取自 ``config`` 或构造参数）。
+
+冻结支持（红线④ / FR-4.6）：
+``to_params()`` / ``from_params()`` 让费率族可整体进出 ``params_snapshot``，
+结算复算一律用冻结费率构造的 ``CostModel``，**不读当前 config**。
 
 成交价口径（含滑点）：
 - 买入：``exec_price = ref_price × (1 + slippage_rate)``
 - 卖出：``exec_price = ref_price × (1 - slippage_rate)``
 - 成交价与各项费用均**四舍五入到分**（half-up）。
 """
-
 from __future__ import annotations
 
 import json
@@ -46,8 +49,9 @@ class FeeDetail:
     commission: float  # 佣金（含规费）
     stamp_tax: float  # 印花税（仅卖出）
     transfer_fee: float  # 过户费（双向）
+    regulation_fee: float  # 规费（经手费+证管费；默认 0，含在全佣内）
     slippage: float  # 滑点成本（金额）
-    total_fee: float  # commission + stamp_tax + transfer_fee
+    total_fee: float  # commission + stamp_tax + transfer_fee + regulation_fee
     fee_version: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -66,6 +70,7 @@ class CostModel:
         min_commission: 最低佣金。
         stamp_tax_rate: 印花税率（卖出）。
         transfer_fee_rate: 过户费率（双向）。
+        regulation_fee_rate: 规费率（默认 0；含在全佣内）。
         slippage_rate: 滑点率（双向）。
         fee_version: 费率版本号。
     """
@@ -78,6 +83,7 @@ class CostModel:
         min_commission: float | None = None,
         stamp_tax_rate: float | None = None,
         transfer_fee_rate: float | None = None,
+        regulation_fee_rate: float | None = None,
         slippage_rate: float | None = None,
         fee_version: str | None = None,
     ) -> None:
@@ -86,6 +92,9 @@ class CostModel:
         self.min_commission: float = cfg.min_commission if min_commission is None else min_commission
         self.stamp_tax_rate: float = cfg.stamp_tax_rate if stamp_tax_rate is None else stamp_tax_rate
         self.transfer_fee_rate: float = cfg.transfer_fee_rate if transfer_fee_rate is None else transfer_fee_rate
+        self.regulation_fee_rate: float = (
+            getattr(cfg, "regulation_fee_rate", 0.0) if regulation_fee_rate is None else regulation_fee_rate
+        )
         self.slippage_rate: float = cfg.slippage_rate if slippage_rate is None else slippage_rate
         self.fee_version: str = fee_version or cfg.fee_version
 
@@ -130,8 +139,9 @@ class CostModel:
             commission = _cen(self.min_commission)
         stamp_tax = _cen(turnover * self.stamp_tax_rate) if s == SELL else 0.0
         transfer_fee = _cen(turnover * self.transfer_fee_rate)
+        regulation_fee = _cen(turnover * self.regulation_fee_rate)
         slippage = _cen(abs(ep - ref_price) * shares)
-        total_fee = _cen(commission + stamp_tax + transfer_fee)
+        total_fee = _cen(commission + stamp_tax + transfer_fee + regulation_fee)
         return FeeDetail(
             side=s,
             shares=int(shares),
@@ -141,6 +151,7 @@ class CostModel:
             commission=float(commission),
             stamp_tax=float(stamp_tax),
             transfer_fee=float(transfer_fee),
+            regulation_fee=float(regulation_fee),
             slippage=float(slippage),
             total_fee=float(total_fee),
             fee_version=self.fee_version,
@@ -154,15 +165,47 @@ class CostModel:
         return _cen(fee.turnover - fee.total_fee)
 
     def to_params(self) -> dict[str, Any]:
-        """导出当前费率参数（写入快照用）。"""
+        """导出当前费率参数（写入快照用；FR-4.6 费率族冻结）。"""
         return {
             "commission_rate": self.commission_rate,
             "min_commission": self.min_commission,
             "stamp_tax_rate": self.stamp_tax_rate,
             "transfer_fee_rate": self.transfer_fee_rate,
+            "regulation_fee_rate": self.regulation_fee_rate,
             "slippage_rate": self.slippage_rate,
             "fee_version": self.fee_version,
         }
+
+    @classmethod
+    def from_params(cls, params: dict[str, Any] | None) -> CostModel:
+        """由**冻结费率**构造 ``CostModel``（红线④：结算复算只读快照，不读当前 config）。
+
+        Args:
+            params: ``to_params()`` 的产物（可为 None → 全用默认）。
+
+        Returns:
+            以冻结值构造的 ``CostModel``。
+        """
+        p = params or {}
+
+        def _pick(key: str, default: float) -> float:
+            v = p.get(key)
+            try:
+                return default if v is None else float(v)
+            except (TypeError, ValueError):
+                return default
+
+        defaults = default_settings
+        return cls(
+            None,
+            commission_rate=_pick("commission_rate", defaults.commission_rate),
+            min_commission=_pick("min_commission", defaults.min_commission),
+            stamp_tax_rate=_pick("stamp_tax_rate", defaults.stamp_tax_rate),
+            transfer_fee_rate=_pick("transfer_fee_rate", defaults.transfer_fee_rate),
+            regulation_fee_rate=_pick("regulation_fee_rate", getattr(defaults, "regulation_fee_rate", 0.0)),
+            slippage_rate=_pick("slippage_rate", defaults.slippage_rate),
+            fee_version=str(p.get("fee_version") or defaults.fee_version),
+        )
 
 
 __all__ = ["CostModel", "FeeDetail", "BUY", "SELL", "VALID_SIDES"]

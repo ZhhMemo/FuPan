@@ -1,10 +1,15 @@
-"""SnapshotFreezer：结算快照冻结（红线④）。
+"""SnapshotFreezer：结算快照冻结（红线④ / FR-4.6）。
 
-红线④：**任何结算/复算只能读 ``fact_order.params_snapshot``，禁止重读当前 ``adj_factor``/费率。**
-因此：
-- ``freeze`` 在**首次**下单/结算时把「费率版本 + 复权因子 + 成交价 + 结算窗口输入」一并冻结；
-- ``freeze`` 具备**幂等性**：若订单已存在冻结快照，则**原样返回**，绝不覆盖；
-- ``SettlementEngine`` 一律从快照取值，从而「即使事后修改 ``adj_factor``，重算结果完全一致」。
+红线④：**任何结算/复算只能读 ``fact_order.params_snapshot``，禁止重读当前 ``adj_factor``/费率/结算窗口。**
+
+因此快照必须冻结**结算所需的全部输入**：
+- **复权因子**（成交日 / 退出日 / 起始日）；
+- **端点未复权价**（成交日 / 退出日 / 起始日收盘）与**基准指数**端点；
+- **费率族**（佣金率 / 最低佣金 / 印花税率 / 过户费率 / 规费率 / 滑点率 + ``fee_version``）；
+- **结算窗口**（交易日数）与**成交时点**（口径 / 成交日 / 成交时刻）；
+- **下单后的账户状态**（现金 / 股数 / 摊薄成本 / 可用股数）—— 使结算无需用当前费率重放订单。
+
+``freeze`` 具备**幂等性**：若订单已存在冻结快照，则**原样返回**，绝不覆盖。
 """
 
 from __future__ import annotations
@@ -26,6 +31,16 @@ from app.data.repository import Repository
 log = get_logger(__name__)
 
 FROZEN_MARKER = "frozen_at"
+
+# 费率族键（冻结进快照；结算只读这些值，**不重读当前 config**）
+FEE_KEYS: tuple[str, ...] = (
+    "commission_rate",
+    "min_commission",
+    "stamp_tax_rate",
+    "transfer_fee_rate",
+    "regulation_fee_rate",
+    "slippage_rate",
+)
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -55,6 +70,30 @@ def _parse_snapshot(raw: Any) -> dict[str, Any] | None:
             return None
         return data if isinstance(data, dict) else None
     return None
+
+
+def _account_to_dict(account: Any) -> dict[str, Any]:
+    """把下单后账户（``Account`` / dict / 对象）转为可 JSON 序列化的冻结字典。"""
+    if account is None:
+        return {}
+    if isinstance(account, dict):
+        pos = account.get("position") or {}
+        if isinstance(pos, dict):
+            return {
+                "cash": float(account.get("cash", 0.0) or 0.0),
+                "initial_cash": float(account.get("initial_cash", 0.0) or 0.0),
+                "shares": int(pos.get("shares", 0) or 0),
+                "available_shares": int(pos.get("available_shares", 0) or 0),
+                "avg_cost": float(pos.get("avg_cost", 0.0) or 0.0),
+            }
+    pos = getattr(account, "position", None)
+    return {
+        "cash": float(getattr(account, "cash", 0.0) or 0.0),
+        "initial_cash": float(getattr(account, "initial_cash", 0.0) or 0.0),
+        "shares": int(getattr(pos, "shares", 0) or 0) if pos is not None else 0,
+        "available_shares": int(getattr(pos, "available_shares", 0) or 0) if pos is not None else 0,
+        "avg_cost": float(getattr(pos, "avg_cost", 0.0) or 0.0) if pos is not None else 0.0,
+    }
 
 
 class SnapshotFreezer:
@@ -134,31 +173,51 @@ class SnapshotFreezer:
         code: str,
         fill_day: date | str,
         exit_day: date | str,
-        fee_version: str,
+        fee_version: str | None = None,
         fill_price: float | None = None,
         start_day: date | str | None = None,
         benchmark_code: str | None = None,
+        cost_model: Any = None,
+        window: int | None = None,
+        account: Any = None,
+        fill_price_source: str | None = None,
+        decision_day: date | str | None = None,
+        fill_ts: Any = None,
         extra: dict[str, Any] | None = None,
     ) -> ParamsSnapshot:
-        """按证券与日期自动收集「复权因子 + 端点未复权价 + 基准」后冻结（幂等）。
+        """按证券与日期自动收集「复权因子 + 端点未复权价 + 基准 + **费率族 + 结算窗口 + 账户**」后冻结（幂等）。
 
-        冻结项全部写入 ``extra``，使得 ``SettlementEngine`` **无需重读当前 ``adj_factor``**，
-        从而满足红线④（事后改因子重算完全一致）。
+        冻结项全部写入 ``extra``，使得 ``SettlementEngine`` **无需重读当前 ``adj_factor`` / 费率 / 窗口**，
+        从而满足红线④ / FR-4.6（事后改因子、改费率、改滑点、改窗口，重算结果完全一致）。
 
         Args:
             order: 订单。
             code: 证券代码。
-            fill_day: 成交日（决策日）。
+            fill_day: **成交日**（默认 T+1）。
             exit_day: 结算退出日。
-            fee_version: 费率版本。
+            fee_version: 费率版本；None 时取 ``cost_model`` / 配置。
             fill_price: 成交价；None 则取订单 ``price``。
             start_day: 题目起始日（用于「全程持有对照」）。
             benchmark_code: 基准指数代码（默认沪深300 ``sh.000300``）。
+            cost_model: 成本模型（**冻结其费率族**）；None 用当前配置构造。
+            window: 结算窗口（交易日数）；None 取当前配置 ``settle_window``。
+            account: 下单后账户（冻结现金 / 股数 / 成本 / 可用）；None 不冻结。
+            fill_price_source: 成交价口径（``t1_open`` / ``t1_close`` / ``t0_close``）。
+            decision_day: 决策日 T。
+            fill_ts: 成交时刻（datetime）。
             extra: 额外冻结项。
         """
         existing = self.load(order)
         if existing is not None and FROZEN_MARKER in existing.extra:
             return existing
+
+        from app.engine.cost import CostModel  # 局部导入，规避潜在循环依赖
+
+        cm = cost_model if cost_model is not None else CostModel(self._cfg)
+        fee_params: dict[str, Any] = dict(cm.to_params())
+        fee_version = fee_version or str(fee_params.get("fee_version") or self._cfg.fee_version)
+        # 兜底：确保规费率字段存在（历史 CostModel 可能未提供）
+        fee_params.setdefault("regulation_fee_rate", float(getattr(self._cfg, "regulation_fee_rate", 0.0)))
 
         bench = benchmark_code or self._cfg.default_index_codes[0]
         merged: dict[str, Any] = {
@@ -172,7 +231,18 @@ class SnapshotFreezer:
             "benchmark_code": bench,
             "benchmark_entry": self._index_close(bench, fill_day),
             "benchmark_exit": self._index_close(bench, exit_day),
+            # ── 费率族 + 结算窗口 + 成交时点（FR-4.6）──
+            "fee_version": fee_version,
+            "settle_window": int(window if window is not None else self._cfg.settle_window),
+            "fill_price_source": str(fill_price_source or getattr(self._cfg, "fill_price_source", "t1_open")),
         }
+        merged.update(fee_params)
+        if decision_day is not None:
+            merged["decision_day"] = str(pd.Timestamp(decision_day).date())
+        if fill_ts is not None:
+            merged["fill_ts"] = fill_ts.isoformat() if hasattr(fill_ts, "isoformat") else str(fill_ts)
+        if account is not None:
+            merged["account"] = _account_to_dict(account)
         if start_day is not None:
             merged["start_day"] = str(pd.Timestamp(start_day).date())
             merged["start_adj_factor"] = self._adj_factor(code, start_day)
@@ -225,4 +295,4 @@ class SnapshotFreezer:
         return None if val is None or pd.isna(val) else float(val)
 
 
-__all__ = ["SnapshotFreezer", "FROZEN_MARKER"]
+__all__ = ["SnapshotFreezer", "FROZEN_MARKER", "FEE_KEYS"]

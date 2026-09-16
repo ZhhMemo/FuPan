@@ -4,16 +4,25 @@
 - ``place_order`` **无状态**、**可被多次调用**（N13：不写死「一题只能调一次」），
   预留 ``decision_point`` 参数（M1 只用单决策点，多决策点扩展位）；
 - 全部账户状态外置于 ``Account``，引擎本身不缓存任何状态；
-- 成交价取「决策日收盘」并按 ``CostModel`` 计入滑点与手续费；
-- 成交可行性由 ``TradeRuleEngine`` 判定（红线③）：停牌/一字板 → 拒单并给出顺延日；
+- **成交时点（FR-4.8，默认 T+1 开盘价）**：``place_order(day=决策日 T)`` 内部解析成交日
+  （``fill_price_source`` ∈ ``t1_open``(默认) / ``t1_close`` / ``t0_close``），
+  成交价 = 成交日参考价 × (1 ± 滑点)；
+- 成交可行性由 ``TradeRuleEngine`` 判定（红线③）：停牌/一字板/开盘即封板 → 拒单并给出顺延日；
 - 除权处理 ``apply_dividend``：送股调股数、现金分红入现金（红利税按 0 简化，NA5）。
+
+成交日解析约定（**关键**）：
+``day`` 参数是**决策日 T**（用户做决定、提交订单之日）；实际成交发生在按
+``fill_price_source`` 解析出的**成交日**（默认 = T 之后的第一个交易日，即 T+1）。
+``Fill.dt`` 为**下单时间戳**（决策日），``Fill.fill_day`` 为**实际成交日**。
+因此 ``fact_order.dt`` 记录的是决策日，回放（``replay_orders``）以决策日重跑即可完全复现。
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from datetime import time as dtime
 from typing import Any
 
 import pandas as pd
@@ -29,6 +38,14 @@ from app.engine.rules import TradeRuleEngine
 
 log = get_logger(__name__)
 
+# 合法成交价口径（FR-4.8）
+FILL_PRICE_SOURCES: tuple[str, ...] = ("t1_open", "t1_close", "t0_close")
+# T+1 解析时向后探查交易日历的自然日窗口
+_FILL_LOOKAHEAD_DAYS = 30
+# 成交时刻（用于快照留痕）：开盘成交取 09:30，收盘成交取 15:00
+_OPEN_TIME = dtime(9, 30)
+_CLOSE_TIME = dtime(15, 0)
+
 
 @dataclass(slots=True)
 class Fill:
@@ -40,14 +57,18 @@ class Fill:
     shares: int
     price: float  # 实际成交价（含滑点）；未成交为 0.0
     ref_price: float  # 参考价（未含滑点）
-    dt: datetime
+    dt: datetime  # **下单时间戳**（决策日）
     cash_after: float
     position_after: int
     fee: FeeDetail | None = None
     realized_pnl: float = 0.0
-    reason: str = ""  # 拒单原因（停牌/一字板/现金不足/可用不足）
+    reason: str = ""  # 拒单原因（停牌/一字板/开盘即封板/现金不足/可用不足）
     deferred_to: date | None = None  # 顺延到的下一个可成交日
     decision_point: date | None = None  # N13 预留：本次下单所属决策点
+    decision_day: date | None = None  # 决策日 T（= dt 的日期）
+    fill_day: date | None = None  # **实际成交日**（默认 T+1）
+    fill_ts: datetime | None = None  # **实际成交时刻**（t1_open → T+1 09:30）
+    fill_price_source: str = ""  # 本次采用的成交价口径
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -64,6 +85,10 @@ class Fill:
             "reason": self.reason,
             "deferred_to": self.deferred_to.isoformat() if self.deferred_to else None,
             "decision_point": self.decision_point.isoformat() if self.decision_point else None,
+            "decision_day": self.decision_day.isoformat() if self.decision_day else None,
+            "fill_day": self.fill_day.isoformat() if self.fill_day else None,
+            "fill_ts": self.fill_ts.isoformat() if self.fill_ts else None,
+            "fill_price_source": self.fill_price_source,
             "fee": self.fee.to_dict() if self.fee else None,
         }
 
@@ -79,6 +104,7 @@ class TradeEngine:
         cost_model: 成本模型；None 用默认。
         rules: 规则引擎；None 用默认。
         config: 配置。
+        fill_price_source: 成交价口径（覆盖 config）；∈ ``t1_open`` / ``t1_close`` / ``t0_close``。
     """
 
     def __init__(
@@ -87,11 +113,17 @@ class TradeEngine:
         cost_model: CostModel | None = None,
         rules: TradeRuleEngine | None = None,
         config: Settings | None = None,
+        *,
+        fill_price_source: str | None = None,
     ) -> None:
         self._cfg = config or default_settings
         self._repo: Repository = repository or Repository()
         self.cost_model: CostModel = cost_model or CostModel(self._cfg)
         self.rules: TradeRuleEngine = rules or TradeRuleEngine(self._repo, self._cfg)
+        src = str(fill_price_source or getattr(self._cfg, "fill_price_source", "t1_open")).lower()
+        if src not in FILL_PRICE_SOURCES:
+            raise ValidationError(f"非法成交价口径：{src}（应为 {'/'.join(FILL_PRICE_SOURCES)}）")
+        self.fill_price_source: str = src
 
     # ─────────────── 行情 ───────────────
     def resolve_bar(self, code: str, day: date | str) -> pd.Series | None:
@@ -100,6 +132,39 @@ class TradeEngine:
         if df is None or df.empty:
             return None
         return df.iloc[0]
+
+    # ─────────────── 成交日 / 成交价（FR-4.8）───────────────
+    def resolve_fill_day(self, code: str, decision_day: date, source: str | None = None) -> date | None:
+        """由**决策日 T** 解析**成交日**（默认 T+1）。
+
+        Args:
+            code: 证券代码。
+            decision_day: 决策日 T。
+            source: 覆盖成交价口径；None 用引擎自身口径。
+
+        Returns:
+            - ``t0_close``  → 决策日当天（T）；
+            - ``t1_open`` / ``t1_close`` → 决策日之后**第一个交易日**（T+1）；
+              交易日历缺失时返回 ``None``（调用方据此拒单，明确失败）。
+        """
+        src = (source or self.fill_price_source).lower()
+        if src == "t0_close":
+            return decision_day
+        horizon = decision_day + timedelta(days=_FILL_LOOKAHEAD_DAYS)
+        try:
+            days = self._repo.get_trading_days(decision_day, horizon)
+        except Exception as exc:  # noqa: BLE001 - 日历不可用 → 明确失败
+            log.warning("resolve_fill_day_calendar_failed", error=str(exc))
+            days = []
+        future = [d for d in days if d > decision_day]
+        return future[0] if future else None
+
+    def _fill_ref_price(self, bar: Any, source: str | None = None) -> float:
+        """成交参考价（未含滑点）：``t1_open`` 取开盘价，其余取收盘价。"""
+        src = (source or self.fill_price_source).lower()
+        key = "open" if src == "t1_open" else "close"
+        val = bar.get(key) if hasattr(bar, "get") else getattr(bar, key, None)
+        return 0.0 if val is None or pd.isna(val) else float(val)
 
     # ─────────────── 下单 ───────────────
     def place_order(
@@ -118,13 +183,17 @@ class TradeEngine:
     ) -> Fill:
         """下单（**可被多次调用**，状态全部落在 ``account`` 上）。
 
+        成交时点（FR-4.8）：``day`` 为**决策日 T**；引擎按 ``fill_price_source`` 解析**成交日**
+        （默认 T+1），成交价 = 成交日参考价 × (1 ± 滑点)。成交可行性（停牌/一字板/开盘即封板）
+        一律在**成交日**判定。
+
         Args:
             account: 账户（**原地修改**：现金 / 持仓）。
             code: 证券代码。
             side: ``buy`` / ``sell``。
             shares: 股数（>0）。
-            day: 成交日（决策日）。
-            dt: 成交时间戳；None 取决策日收盘时间。
+            day: **决策日 T**（用户提交订单之日）。
+            dt: 下单时间戳；None 取决策日 15:00。
             decision_point: N13 预留：本次下单所属决策点（M1 = ``day``）。
             order_id / question_id / session_id: 仅透传到 ``Fill``（便于落库）。
 
@@ -141,39 +210,70 @@ class TradeEngine:
             raise ValidationError(f"股数必须为正整数：{shares}")
         shares = int(shares)
 
-        day_d = pd.Timestamp(day).date()
-        dp = pd.Timestamp(decision_point).date() if decision_point is not None else day_d
-        ts = dt or datetime.combine(day_d, datetime.min.time()).replace(hour=15)
+        decision_day = pd.Timestamp(day).date()
+        dp = pd.Timestamp(decision_point).date() if decision_point is not None else decision_day
+        src = self.fill_price_source
+        # 下单时间戳 = 决策日（fact_order.dt）；成交时间另行解析（Fill.fill_ts）
+        order_ts = dt or datetime.combine(decision_day, _CLOSE_TIME)
 
-        bar = self.resolve_bar(code, day_d)
+        # 1) 解析成交日（默认 T+1）
+        fill_day = self.resolve_fill_day(code, decision_day, src)
+        if fill_day is None:
+            return self._reject(
+                code, side_l, shares, decision_day, order_ts, account, dp,
+                reason="无法确定成交日（交易日历缺少决策点之后的数据）",
+                defer_from=decision_day, src=src,
+            )
+
+        fill_ts = datetime.combine(fill_day, _OPEN_TIME if src == "t1_open" else _CLOSE_TIME)
+
+        # 2) 成交日行情
+        bar = self.resolve_bar(code, fill_day)
         if bar is None:
             return self._reject(
-                code, side_l, shares, day_d, ts, account, dp,
-                reason="当日无行情数据（非交易日/未覆盖）",
+                code, side_l, shares, decision_day, order_ts, account, dp,
+                reason=f"成交日 {fill_day} 无行情数据（非交易日/未覆盖）",
+                defer_from=fill_day, src=src, fill_day=fill_day, fill_ts=fill_ts,
             )
 
         if self.rules.is_suspended(bar):
             return self._reject(
-                code, side_l, shares, day_d, ts, account, dp,
-                reason="停牌/无成交，不可交易",
+                code, side_l, shares, decision_day, order_ts, account, dp,
+                reason="成交日停牌/无成交，不可交易",
+                defer_from=fill_day, src=src, fill_day=fill_day, fill_ts=fill_ts,
             )
 
-        ref_price = float(bar["close"])
-        prev_close = self._repo.get_prev_close(code, day_d)
-        limit_up, limit_down = self.rules.limit_prices(code, day_d, prev_close)
+        # 3) 成交参考价（默认 T+1 开盘价）+ 涨跌停
+        ref_price = self._fill_ref_price(bar, src)
+        if ref_price <= 0:
+            return self._reject(
+                code, side_l, shares, decision_day, order_ts, account, dp,
+                reason="成交日参考价非法（≤0）",
+                defer_from=fill_day, src=src, fill_day=fill_day, fill_ts=fill_ts,
+            )
+        prev_close = self._repo.get_prev_close(code, fill_day)
+        limit_up, limit_down = self.rules.limit_prices(code, fill_day, prev_close)
 
         if side_l == BUY:
             if self.rules.is_one_word_up(bar, limit_up):
                 return self._reject(
-                    code, side_l, shares, day_d, ts, account, dp,
+                    code, side_l, shares, decision_day, order_ts, account, dp,
                     reason="一字涨停，无法买入",
+                    defer_from=fill_day, src=src, fill_day=fill_day, fill_ts=fill_ts,
+                )
+            if self.rules.open_seal_blocks_buy(bar, limit_up):
+                return self._reject(
+                    code, side_l, shares, decision_day, order_ts, account, dp,
+                    reason="开盘即封板（开盘价=涨停价），保守规则视为无法买入",
+                    defer_from=fill_day, src=src, fill_day=fill_day, fill_ts=fill_ts,
                 )
             fee = self.cost_model.calc(BUY, ref_price, shares)
             need = fee.turnover + fee.total_fee
             if account.cash + 1e-9 < need:
                 return self._reject(
-                    code, side_l, shares, day_d, ts, account, dp,
+                    code, side_l, shares, decision_day, order_ts, account, dp,
                     reason=f"现金不足（需 {need:.2f}，有 {account.cash:.2f}）",
+                    defer_from=fill_day, src=src, fill_day=fill_day, fill_ts=fill_ts,
                 )
             account.cash = round(account.cash - need, 2)
             if account.position.code == "":
@@ -187,23 +287,29 @@ class TradeEngine:
                 shares=shares,
                 price=fee.exec_price,
                 ref_price=ref_price,
-                dt=ts,
+                dt=order_ts,
                 cash_after=account.cash,
                 position_after=int(account.position.shares),
                 fee=fee,
                 decision_point=dp,
+                decision_day=decision_day,
+                fill_day=fill_day,
+                fill_ts=fill_ts,
+                fill_price_source=src,
             )
 
         # sell
         if self.rules.is_one_word_down(bar, limit_down):
             return self._reject(
-                code, side_l, shares, day_d, ts, account, dp,
+                code, side_l, shares, decision_day, order_ts, account, dp,
                 reason="一字跌停，无法卖出",
+                defer_from=fill_day, src=src, fill_day=fill_day, fill_ts=fill_ts,
             )
         if int(account.position.available_shares) < shares:
             return self._reject(
-                code, side_l, shares, day_d, ts, account, dp,
+                code, side_l, shares, decision_day, order_ts, account, dp,
                 reason=f"可用股数不足（T+1，可用 {account.position.available_shares}）",
+                defer_from=fill_day, src=src, fill_day=fill_day, fill_ts=fill_ts,
             )
         fee = self.cost_model.calc(SELL, ref_price, shares)
         account.cash = round(account.cash + fee.turnover - fee.total_fee, 2)
@@ -215,12 +321,16 @@ class TradeEngine:
             shares=shares,
             price=fee.exec_price,
             ref_price=ref_price,
-            dt=ts,
+            dt=order_ts,
             cash_after=account.cash,
             position_after=int(account.position.shares),
             fee=fee,
             realized_pnl=realized,
             decision_point=dp,
+            decision_day=decision_day,
+            fill_day=fill_day,
+            fill_ts=fill_ts,
+            fill_price_source=src,
         )
 
     def _reject(
@@ -233,11 +343,17 @@ class TradeEngine:
         account: Account,
         decision_point: date,
         reason: str,
+        *,
+        defer_from: date | None = None,
+        src: str = "",
+        fill_day: date | None = None,
+        fill_ts: datetime | None = None,
     ) -> Fill:
-        """构造一个拒单结果，并给出顺延日（一字板/停牌才有顺延意义）。"""
+        """构造一个拒单结果，并给出顺延日（一字板/停牌/开盘即封板才有顺延意义）。"""
         deferred: date | None = None
+        start = defer_from or day
         try:
-            deferred = self.rules.next_tradable(code, day, side)
+            deferred = self.rules.next_tradable(code, start, side)
         except Exception:  # noqa: BLE001 - 顺延失败不影响拒单结论
             deferred = None
         log.info("order_rejected", code=code, side=side, reason=reason, deferred_to=str(deferred))
@@ -255,6 +371,10 @@ class TradeEngine:
             reason=reason,
             deferred_to=deferred,
             decision_point=decision_point,
+            decision_day=day,
+            fill_day=fill_day,
+            fill_ts=fill_ts,
+            fill_price_source=src,
         )
 
     # ─────────────── 除权 ───────────────
@@ -341,6 +461,9 @@ def replay_orders(engine: TradeEngine, question: Any, orders: list[Any]) -> Acco
 
     回放走同一个 ``TradeEngine.place_order``（红线⑤：全市场唯一成交实现），
     因此账户面板与结算口径完全一致、可复现。
+
+    注：``fact_order.dt`` 记录的是**决策日 T**（下单时间）。回放以 ``dt`` 的日期为决策日
+    重跑，成交日由引擎按 ``fill_price_source`` 解析（默认 T+1），与实时下单完全一致。
     """
     acc = build_initial_account(question)
     code = str(_qget(question, "code", "") or acc.position.code)
@@ -356,4 +479,4 @@ def replay_orders(engine: TradeEngine, question: Any, orders: list[Any]) -> Acco
     return acc
 
 
-__all__ = ["TradeEngine", "Fill", "build_initial_account", "replay_orders"]
+__all__ = ["TradeEngine", "Fill", "FILL_PRICE_SOURCES", "build_initial_account", "replay_orders"]

@@ -3,6 +3,7 @@
 职责（对齐设计 §21 / 验收点）：
 - **停牌**：``is_trade=False`` 或当日无成交（``volume<=0``）→ 不可成交；
 - **一字板**：一字涨停无法买入、一字跌停无法卖出 → 拒单并**顺延**到下一个可成交日；
+- **开盘即封板**（``00`` §7 规则#4，**可配置开关**）：``开盘价 == 涨停价`` → 视为无法买入（保守规则）；
 - **板块涨跌停**：优先读 ``dim_limit`` 预计算值，缺失则按前收现算（``models.limit_pct_of``）；
 - **T+1**：当日买入不可卖（由 ``Position.available_shares`` 体现）；
 - **顺延到分**：``next_tradable(code, start, side)`` 返回下一个可成交交易日。
@@ -21,7 +22,7 @@ import pandas as pd
 from app.config import Settings
 from app.config import settings as default_settings
 from app.core.logging import get_logger
-from app.data.models import limit_pct_of, round_to_cent
+from app.data.models import limit_pct_of, limit_prices_of
 from app.data.repository import Repository
 
 log = get_logger(__name__)
@@ -99,8 +100,9 @@ class TradeRuleEngine:
         pct = limit_pct_of(code, day)
         if pct is None:
             return None, None
-        up = round_to_cent(float(pc) * (1 + pct))
-        down = round_to_cent(float(pc) * (1 - pct))
+        # 取整走 models.limit_prices_of（Decimal HALF_UP，唯一实现）；
+        # 不可用 round_to_cent(prev * (1 ± pct))——浮点乘法会「少 1 分」。
+        up, down = limit_prices_of(float(pc), pct)
         return (None if up is None else float(up)), (None if down is None else float(down))
 
     # ─────────────── 一字板 ───────────────
@@ -128,12 +130,37 @@ class TradeRuleEngine:
             return True
         return False
 
+    # ─────────────── 开盘即封板（`00` §7 规则#4）───────────────
+    def is_open_sealed_up(self, bar: Any, limit_up: float | None = None) -> bool:
+        """是否「开盘即封板」：``开盘价 == 涨停价``。
+
+        保守规则（**可配置开关**，见 ``config.open_seal_no_buy``）：开盘即以涨停价开板、
+        散户难以在开盘价成交 → 视为**无法买入**（但不顺延，与一字板的严格封死不同）。
+
+        Returns:
+            ``True`` 表示开盘价触及涨停价。
+        """
+        if limit_up is None:
+            return False
+        o = _val(bar, "open")
+        if o is None or pd.isna(o):
+            return False
+        return abs(float(o) - float(limit_up)) <= _PRICE_TOL
+
+    def open_seal_blocks_buy(self, bar: Any, limit_up: float | None = None) -> bool:
+        """是否因「开盘即封板」而禁止买入（受配置开关控制）。"""
+        if not bool(getattr(self._cfg, "open_seal_no_buy", True)):
+            return False
+        return self.is_open_sealed_up(bar, limit_up)
+
     # ─────────────── 可否成交 ───────────────
     def can_buy(self, bar: Any, limit_up: float | None = None) -> bool:
-        """可否买入：非停牌 且 非一字涨停。"""
+        """可否买入：非停牌 且 非一字涨停 且 非「开盘即封板」（保守规则，可配置）。"""
         if self.is_suspended(bar):
             return False
-        return not self.is_one_word_up(bar, limit_up)
+        if self.is_one_word_up(bar, limit_up):
+            return False
+        return not self.open_seal_blocks_buy(bar, limit_up)
 
     def can_sell(self, bar: Any, position: Any = None, limit_down: float | None = None) -> bool:
         """可否卖出：非停牌 且 非一字跌停 且 可用股数 > 0（T+1）。"""

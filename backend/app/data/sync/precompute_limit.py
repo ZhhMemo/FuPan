@@ -28,7 +28,7 @@ import pandas as pd
 
 from app.core.logging import get_logger
 from app.core.timeutil import now_bj
-from app.data.models import SyncResult, limit_pct_of, round_to_cent
+from app.data.models import SyncResult, limit_pct_of, limit_prices_of
 from app.data.repository import Repository
 
 log = get_logger(__name__)
@@ -65,12 +65,15 @@ def limit_prices(
 
     Returns:
         ``(limit_up, limit_down)``；当日无涨跌停限制（如 1996-12-16 之前）时返回 ``(None, None)``。
+
+    Note:
+        取整走 ``models.limit_prices_of``（Decimal HALF_UP，唯一实现），
+        **不可**改用 ``round_to_cent(prev * (1 ± pct))``（浮点会少 1 分）。
     """
     ratio = pct if pct is not None else limit_pct_of(code, day)
     if ratio is None:
         return None, None
-    up = round_to_cent(prev_close * (1 + ratio))
-    down = round_to_cent(prev_close * (1 - ratio))
+    up, down = limit_prices_of(prev_close, ratio)
     return up, down
 
 

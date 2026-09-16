@@ -77,3 +77,28 @@ def test_next_tradable_skip_one_word() -> None:
     # 2024-01-02 是非交易日（volume=0 → 视为停牌/无成交），顺延到 01-03
     nxt = eng.next_tradable("sz.000001", "2024-01-02", "buy")
     assert str(nxt) == "2024-01-03"
+
+
+# ══════════════════ `00` §7 规则#4：开盘即封板 ══════════════════
+def test_open_seal_blocks_buy() -> None:
+    """开盘价 == 涨停价 → 视为无法买入（保守规则）。"""
+    eng = TradeRuleEngine(StubRepo())
+    # 有振幅（非一字），但开盘价触及涨停
+    bar = {"open": 11.0, "high": 11.5, "low": 10.8, "close": 11.2, "volume": 1_000_000, "is_trade": True}
+    assert eng.is_open_sealed_up(bar, limit_up=11.0) is True
+    assert eng.is_one_word_up(bar, limit_up=11.0) is False  # 非一字
+    assert eng.can_buy(bar, limit_up=11.0) is False
+    # 开盘价未触涨停 → 可买
+    normal = {"open": 10.0, "high": 11.5, "low": 9.8, "close": 11.2, "volume": 1_000_000, "is_trade": True}
+    assert eng.can_buy(normal, limit_up=11.0) is True
+
+
+def test_open_seal_switch_off_allows_buy() -> None:
+    """配置开关关闭时，开盘即封板不再禁止买入。"""
+    from app.config import Settings
+
+    eng = TradeRuleEngine(StubRepo(), Settings(open_seal_no_buy=False))
+    bar = {"open": 11.0, "high": 11.5, "low": 10.8, "close": 11.2, "volume": 1_000_000, "is_trade": True}
+    assert eng.open_seal_blocks_buy(bar, limit_up=11.0) is False
+    assert eng.can_buy(bar, limit_up=11.0) is True
+

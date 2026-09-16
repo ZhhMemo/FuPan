@@ -31,11 +31,11 @@ interface Props {
 
 const LOT = 100 // A 股一手 100 股
 
-/** 下单面板：股数 + 快捷仓位 + **一键全仓二次确认**（N15）。 */
+/** 下单面板：股数 + 快捷仓位（空仓/1⁄4/1⁄3/半仓/全仓/清仓）+ **一键全仓/清仓二次确认**（N15 / FR-3.4）。 */
 export default function OrderPanel({ account, judgeVerdict, disabled, busy, onSubmit }: Props): ReactElement {
   const [side, setSide] = useState<Side>('buy')
   const [shares, setShares] = useState<number>(LOT)
-  const [confirmFull, setConfirmFull] = useState(false)
+  const [confirmMode, setConfirmMode] = useState<null | 'full' | 'liquidate'>(null)
 
   const price = account?.position.last_price || account?.price || 0
   const cash = account?.cash ?? 0
@@ -50,20 +50,35 @@ export default function OrderPanel({ account, judgeVerdict, disabled, busy, onSu
     return Math.min(lot, cap)
   }
 
-  const setQuick = (fraction: number, isFull = false) => {
-    if (isFull) {
-      setConfirmFull(true)
-      return
-    }
+  const setQuick = (fraction: number) => {
     setShares(clamp(Math.floor(cap * fraction)))
   }
 
-  const doFull = () => {
-    setShares(cap)
-    setConfirmFull(false)
+  // 空仓：不持有（买入方向归零，等同观望）
+  const setEmpty = () => {
+    setSide('buy')
+    setShares(0)
+  }
+
+  // 一键全仓（买入可用上限，需二次确认）
+  const requestFull = () => setConfirmMode('full')
+  // 清仓：卖出全部可用（需二次确认）
+  const requestLiquidate = () => setConfirmMode('liquidate')
+
+  const confirmAction = () => {
+    if (confirmMode === 'full') {
+      setSide('buy')
+      setShares(maxBuy)
+    } else if (confirmMode === 'liquidate') {
+      setSide('sell')
+      setShares(maxSell)
+    }
+    setConfirmMode(null)
   }
 
   const canSubmit = !disabled && !busy && shares > 0 && shares <= cap
+  const confirmQty = confirmMode === 'liquidate' ? maxSell : maxBuy
+  const confirmSide: Side = confirmMode === 'liquidate' ? 'sell' : 'buy'
 
   return (
     <Card>
@@ -106,14 +121,22 @@ export default function OrderPanel({ account, judgeVerdict, disabled, busy, onSu
             </Typography>
           </Stack>
 
-          <ButtonGroup size="small" variant="outlined">
-            <Button onClick={() => setQuick(0.25)}>1/4</Button>
-            <Button onClick={() => setQuick(1 / 3)}>1/3</Button>
-            <Button onClick={() => setQuick(0.5)}>半仓</Button>
-            <Button color="warning" onClick={() => setQuick(1, true)}>
-              一键全仓
-            </Button>
-          </ButtonGroup>
+          <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+            <ButtonGroup size="small" variant="outlined">
+              <Button onClick={setEmpty}>空仓</Button>
+              <Button onClick={() => setQuick(0.25)}>1/4</Button>
+              <Button onClick={() => setQuick(1 / 3)}>1/3</Button>
+              <Button onClick={() => setQuick(0.5)}>半仓</Button>
+            </ButtonGroup>
+            <ButtonGroup size="small" variant="outlined">
+              <Button color="warning" onClick={requestFull} disabled={maxBuy <= 0}>
+                一键全仓
+              </Button>
+              <Button color="error" onClick={requestLiquidate} disabled={maxSell <= 0}>
+                清仓
+              </Button>
+            </ButtonGroup>
+          </Stack>
 
           <Typography variant="caption" color="text.secondary">
             可买 {maxBuy} 股 / 可卖 {maxSell} 股（可用部分，T+1）
@@ -131,19 +154,25 @@ export default function OrderPanel({ account, judgeVerdict, disabled, busy, onSu
         </Stack>
       </CardContent>
 
-      <Dialog open={confirmFull} onClose={() => setConfirmFull(false)}>
-        <DialogTitle>确认全仓？</DialogTitle>
+      <Dialog open={confirmMode !== null} onClose={() => setConfirmMode(null)}>
+        <DialogTitle>{confirmMode === 'liquidate' ? '确认清仓？' : '确认全仓？'}</DialogTitle>
         <DialogContent>
           <DialogContentText>
-            一键全仓（{cap} 股）是不可逆的大动作，请再次确认。
+            {confirmMode === 'liquidate'
+              ? `清仓将卖出全部可用持仓（${confirmQty} 股），是不可逆的大动作，请再次确认。`
+              : `一键全仓（${confirmQty} 股）是不可逆的大动作，请再次确认。`}
             <br />
-            方向：{side === 'buy' ? '买入' : '卖出'}，预计金额 ≈ {fmtMoney(cap * price)} 元。
+            方向：{confirmSide === 'buy' ? '买入' : '卖出'}，预计金额 ≈ {fmtMoney(confirmQty * price)} 元。
           </DialogContentText>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setConfirmFull(false)}>取消</Button>
-          <Button color="warning" variant="contained" onClick={doFull}>
-            确认全仓
+          <Button onClick={() => setConfirmMode(null)}>取消</Button>
+          <Button
+            color={confirmMode === 'liquidate' ? 'error' : 'warning'}
+            variant="contained"
+            onClick={confirmAction}
+          >
+            {confirmMode === 'liquidate' ? '确认清仓' : '确认全仓'}
           </Button>
         </DialogActions>
       </Dialog>

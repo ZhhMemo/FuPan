@@ -1,10 +1,11 @@
-"""系统管理接口（M0：同步触发 / 进度 / 健康检查 / 参数）。
+"""系统管理接口（M0：同步触发 / 进度 / 健康检查 / 参数 / 训练数据备份）。
 
 对齐设计 §8.7：
 - ``POST /api/admin/sync/daily``  手动触发增量同步
 - ``GET  /api/admin/sync/status`` 查询同步状态
 - ``GET  /api/admin/health``      健康检查报告（P0）
 - ``GET/PUT /api/admin/params``   参数读取 / 更新
+- ``POST /api/admin/backup``      训练数据备份 + **恢复验证**（FR-8.7，P0）
 
 注：M0 阶段**未加鉴权**（认证属 M1）；M1 将在这些路由上挂全局鉴权依赖。
 """
@@ -21,6 +22,7 @@ from app.config import settings
 from app.core.errors import Conflict, ValidationError
 from app.core.logging import get_logger
 from app.core.timeutil import now_bj
+from app.data.backup import TrainingDataBackup
 from app.data.repository import Repository
 from app.data.sync.health_check import HealthCheck
 from app.data.sync.service import run_daily_sync
@@ -40,14 +42,17 @@ _sync_state: dict[str, Any] = {
 }
 _state_lock = threading.Lock()
 
-# 可配置参数键（对齐 §21 成本模型「费率全部可配置」）
+# 可配置参数键（对齐 §21 成本模型「费率全部可配置」+ FR-4.8 成交口径 + `00` §7 开关）
 _PARAM_KEYS = [
     "commission_rate",
     "min_commission",
     "stamp_tax_rate",
     "transfer_fee_rate",
+    "regulation_fee_rate",
     "slippage_rate",
     "fee_version",
+    "fill_price_source",
+    "open_seal_no_buy",
     "sync_hour",
     "sync_minute",
     "settle_window",
@@ -151,6 +156,38 @@ def put_params(payload: dict[str, Any]) -> dict[str, Any]:
     for key, value in payload.items():
         repo.set_setting(f"param.{key}", str(value))
     return _envelope({"updated": list(payload.keys())})
+
+
+# ─────────────── 训练数据备份（FR-8.7，P0）───────────────
+@router.post("/backup")
+def backup_training_data(label: str | None = None) -> dict[str, Any]:
+    """备份 ``app.duckdb`` 并**恢复验证**（真导入临时库 + 逐表比对行数）。
+
+    训练数据不可再生（`05` §安全 / R9），备份必须**验证过能恢复**才算数。
+    """
+    report = TrainingDataBackup(Repository()).backup_and_verify(label)
+    message = "备份完成且恢复验证通过" if report.ok else "备份完成但恢复验证未通过（请检查）"
+    log.info("admin_backup_done", ok=report.ok, backup_dir=report.backup_dir)
+    return _envelope(report.to_dict(), message)
+
+
+@router.get("/backup/list")
+def list_backups() -> dict[str, Any]:
+    """列出已有训练数据备份（目录名 + 大小 + 时间）。"""
+    backup_root = settings.backup_path
+    items: list[dict[str, Any]] = []
+    if backup_root.exists():
+        for d in sorted((p for p in backup_root.glob("app_*") if p.is_dir()), key=lambda p: p.name, reverse=True):
+            size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+            items.append(
+                {
+                    "name": d.name,
+                    "path": str(d),
+                    "size_bytes": size,
+                    "has_schema": (d / "schema.sql").exists(),
+                }
+            )
+    return _envelope({"items": items, "total": len(items), "backup_dir": str(backup_root)})
 
 
 __all__ = ["router"]

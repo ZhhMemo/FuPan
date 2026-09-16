@@ -1,8 +1,9 @@
 """SettlementEngine：账户视角结算（红线④，**不判对错**）。
 
 口径（对齐设计 §21 与验收点）：
-- **只用快照**：所有复权因子 / 费率 / 端点价均取自 ``ParamsSnapshot``，
-  **绝不重读当前 ``adj_factor``** → 「事后修改 ``adj_factor``，重算完全一致」（红线④）；
+- **只用快照**：复权因子 / 端点价 / 基准 / **费率族** / **结算窗口** / **账户状态** 均取自
+  ``ParamsSnapshot``，**绝不重读当前 config** →
+  「事后改 adj_factor / 费率 / 滑点 / 窗口，重算完全一致」（红线④ / FR-4.6）；
 - 账户指标全部为**账户视角**，**不产生** success/fail、对/错、追高/杀跌 等任何字眼；
 - 复算复用 ``TradeEngine`` 的净值口径（红线⑤：全市场唯一成交/持仓实现）。
 
@@ -32,9 +33,10 @@ from app.config import settings as default_settings
 from app.core.logging import get_logger
 from app.data.models import Settlement
 from app.data.repository import Repository
+from app.engine.cost import CostModel
 from app.engine.position import Account, Position
 from app.engine.snapshot import SnapshotFreezer
-from app.engine.trade_engine import TradeEngine
+from app.engine.trade_engine import TradeEngine, replay_orders
 
 log = get_logger(__name__)
 
@@ -123,15 +125,22 @@ class SettlementEngine:
         *,
         account: Account | None = None,
         window: int | None = None,
+        orders: list[Any] | None = None,
     ) -> Settlement:
-        """执行结算（复用快照，不重读当前因子/费率）。
+        """执行结算（**只用快照**，不重读当前因子 / 费率 / 窗口）。
+
+        账户来源优先级（均保证与费率/窗口无关）：
+        ① 快照冻结的账户状态（``extra['account']``）；
+        ② 传入 ``orders`` → 用**冻结费率**构造的 ``TradeEngine`` 回放（红线⑤）；
+        ③ 传入 ``account``（旧口径兜底）。
 
         Args:
             order: 订单（dict/对象），含 ``order_id`` / ``dt`` / ``price`` / ``params_snapshot``。
             question: 题目（dict/对象），含 ``code`` / ``start_date`` / ``end_date`` / ``initial_cash``。
             snapshot: 已冻结快照（``ParamsSnapshot`` 或 dict）；None 则从订单读取或新建（幂等）。
-            account: 下单后的账户；None 视为「本金全现金、无持仓」。
-            window: 覆盖结算窗口（交易日数）；None 取题目/配置默认。
+            account: 下单后的账户（兜底，仅当快照未冻结账户且未传 orders 时使用）。
+            window: 覆盖结算窗口（交易日数）；**仅当快照未冻结窗口时**生效。
+            orders: 题目全部订单；提供则用冻结费率回放账户。
 
         Returns:
             ``Settlement``（账户视角，无对错语义）。
@@ -141,14 +150,11 @@ class SettlementEngine:
         start_date = _as_date(_g(question, "start_date"))
         end_date = _as_date(_g(question, "end_date"))
         initial_cash = float(_g(question, "initial_cash", 100000.0) or 100000.0)
-        win = int(window or _g(question, "settle_window") or self._cfg.settle_window)
 
         fill_dt = _g(order, "dt")
         fill_day = _as_date(fill_dt) or end_date
         if fill_day is None or end_date is None:
             raise ValueError("结算失败：缺少决策日/成交日")
-
-        exit_day, delisted = self.resolve_exit_day(code, end_date, win)
 
         # 1) 取得冻结快照（红线④：优先既有快照，幂等）
         snap = snapshot if snapshot is not None else self.freezer.load(order)
@@ -157,15 +163,22 @@ class SettlementEngine:
                 order,
                 code=code,
                 fill_day=fill_day,
-                exit_day=exit_day,
+                exit_day=self.resolve_exit_day(code, end_date, int(window or self._cfg.settle_window))[0],
                 fee_version=self._cfg.fee_version,
                 fill_price=float(_g(order, "price", 0.0) or 0.0),
                 start_day=start_date,
+                window=int(window) if window is not None else None,
+                account=account,
             )
         extra = getattr(snap, "extra", None)
         if extra is None and isinstance(snap, dict):
             extra = {k: v for k, v in snap.items() if k not in ("fee_version", "adj_factor", "fill_price")}
         extra = extra or {}
+
+        # 2) 结算窗口**只读快照**（缺省才用入参 / 配置）
+        win = int(extra.get("settle_window") or (window if window is not None else self._cfg.settle_window))
+
+        exit_day, delisted = self.resolve_exit_day(code, end_date, win)
 
         af_fill = float(extra.get("adj_factor", getattr(snap, "adj_factor", 1.0)))
         af_exit = float(extra.get("exit_adj_factor", af_fill))
@@ -177,35 +190,33 @@ class SettlementEngine:
         if exit_none is None:
             exit_none = self._close_none(code, exit_day)
 
-        # 2) 标的区间收益（后复权，纯用冻结因子）
+        # 3) 标的区间收益（后复权，纯用冻结因子）
         stock_return = 0.0
         if entry_none and exit_none and af_fill:
             stock_return = (float(exit_none) * af_exit) / (float(entry_none) * af_fill) - 1.0
 
-        # 3) 账户收益（账户视角；窗口内一般无除权，以未复权价近似）
-        acc = account or Account(
-            cash=initial_cash, initial_cash=initial_cash, position=Position(code=code)
-        )
+        # 4) 账户（**只用快照冻结的费率族 / 账户**；账户视角）
+        acc = self._resolve_account(extra, question, orders, account, code, initial_cash)
         exit_price = float(exit_none) if exit_none else 0.0
         exit_value = float(acc.cash) + int(acc.position.shares) * exit_price
         account_return = (exit_value - initial_cash) / initial_cash if initial_cash else 0.0
 
-        # 4) 基准收益（冻结的指数端点）
+        # 5) 基准收益（冻结的指数端点）
         b_entry = extra.get("benchmark_entry")
         b_exit = extra.get("benchmark_exit")
         benchmark_return = 0.0
         if b_entry and b_exit and float(b_entry) != 0:
             benchmark_return = float(b_exit) / float(b_entry) - 1.0
 
-        # 5) 超额 / 机会成本
+        # 6) 超额 / 机会成本
         alpha = account_return - benchmark_return
         opp_cost = stock_return - account_return
 
-        # 6) 最大回撤（窗口内账户权益路径；只用未复权收盘，不涉因子）
+        # 7) 最大回撤（窗口内账户权益路径；只用未复权收盘，不涉因子）
         path_df = self._repo.get_daily(code, start=fill_day, end=exit_day)
         max_dd, hold_days = self._max_drawdown(acc, path_df)
 
-        # 7) 全程持有对照（起始日 → 退出日，后复权；只用冻结因子）
+        # 8) 全程持有对照（起始日 → 退出日，后复权；只用冻结因子）
         hold_all_return = stock_return
         start_none = extra.get("start_close_none")
         af_start = float(extra.get("start_adj_factor", af_fill))
@@ -229,6 +240,37 @@ class SettlementEngine:
             fee_version=str(getattr(snap, "fee_version", self._cfg.fee_version)),
             notes="账户视角结果：仅呈现收益与风险指标",
         )
+
+    # ─────────────── 账户解析（冻结优先）───────────────
+    def _resolve_account(
+        self,
+        extra: dict[str, Any],
+        question: Any,
+        orders: list[Any] | None,
+        account: Account | None,
+        code: str,
+        initial_cash: float,
+    ) -> Account:
+        """按「冻结账户 → 冻结费率回放 → 传入账户 → 空仓」优先级还原下单后账户。"""
+        frozen = extra.get("account")
+        if isinstance(frozen, dict) and frozen:
+            return Account(
+                cash=float(frozen.get("cash", 0.0) or 0.0),
+                initial_cash=float(frozen.get("initial_cash", initial_cash) or initial_cash),
+                position=Position(
+                    code=code,
+                    shares=int(frozen.get("shares", 0) or 0),
+                    available_shares=int(frozen.get("available_shares", 0) or 0),
+                    avg_cost=float(frozen.get("avg_cost", 0.0) or 0.0),
+                ),
+            )
+        if orders:
+            frozen_cm = CostModel.from_params(extra)
+            frozen_engine = TradeEngine(self._repo, cost_model=frozen_cm, config=self._cfg)
+            return replay_orders(frozen_engine, question, orders)
+        if account is not None:
+            return account
+        return Account(cash=initial_cash, initial_cash=initial_cash, position=Position(code=code))
 
     # ─────────────── 工具 ───────────────
     def _close_none(self, code: str, day: date | None) -> float | None:

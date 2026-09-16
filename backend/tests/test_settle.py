@@ -138,3 +138,92 @@ def test_delisted_exit_uses_last_tradable_day() -> None:
     exit_day, delisted = engine.resolve_exit_day(delisted_code, pd.Timestamp("2020-07-01").date(), 20)
     assert delisted is True
     assert str(exit_day) == "2020-07-20"  # 不是 2020-07-21（MAX(date) 会错误取到退市日）
+
+
+# ══════════════════ C / FR-4.6：快照冻结「费率族 + 结算窗口 + 账户」══════════════════
+def _freeze_full(repo, *, window: int = 5, account: Account | None = None):  # type: ignore[no-untyped-def]
+    """用默认费率 + 指定窗口 + 账户，按 API 口径冻结一份完整快照。"""
+    from app.config import Settings
+    from app.engine.cost import CostModel
+    from app.engine.snapshot import SnapshotFreezer
+    from app.engine.trade_engine import replay_orders
+
+    cfg = Settings()
+    engine = SettlementEngine(repo, trade_engine=TradeEngine(repo))
+    order = {"order_id": "o1", "price": 10.0, "dt": ts("2020-01-02")}
+    exit_day, _ = engine.resolve_exit_day(CODE, pd.Timestamp("2020-01-02").date(), window)
+    acc = account if account is not None else replay_orders(TradeEngine(repo), _question(), [order])
+    snap = SnapshotFreezer(repo).freeze_for_order(
+        order,
+        code=CODE,
+        fill_day="2020-01-02",
+        exit_day=exit_day,
+        fee_version="v1",
+        fill_price=10.0,
+        start_day="2019-12-02",
+        cost_model=CostModel(cfg),
+        window=window,
+        account=acc,
+    )
+    order["params_snapshot"] = snap.to_json()
+    return order, snap
+
+
+def test_snapshot_freezes_fee_family_and_window() -> None:
+    """FR-4.6：``params_snapshot`` 必须落**实际费率数值**与**结算窗口**，而非只有 ``fee_version`` 字符串。"""
+    import json
+
+    repo = _repo()
+    _, snap = _freeze_full(repo, window=5)
+    data = json.loads(snap.to_json())
+    for key in (
+        "commission_rate",
+        "min_commission",
+        "stamp_tax_rate",
+        "transfer_fee_rate",
+        "regulation_fee_rate",
+        "slippage_rate",
+    ):
+        assert key in data, f"快照缺少费率族字段：{key}"
+        assert data[key] is not None
+    assert data["settle_window"] == 5
+    assert data["fill_price_source"] == "t1_open"
+    assert data["account"]["cash"] is not None  # 账户已冻结
+
+
+def test_settle_uses_frozen_account_and_window_not_live() -> None:
+    """红线④：结算只读快照 —— 传入任意账户 / 任意窗口，结果**完全一致**。"""
+    repo = _repo()
+    order, snap = _freeze_full(repo, window=5)
+    engine = SettlementEngine(repo, trade_engine=TradeEngine(repo))
+
+    base = engine.settle(order, _question(), snapshot=snap)
+    # 传入被篡改的账户（巨额现金）→ 应被快照账户覆盖
+    wild = Account(cash=9_999_999.0, initial_cash=9_999_999.0, position=Position(code=CODE, shares=12345))
+    tampered = engine.settle(order, _question(), snapshot=snap, account=wild)
+    # 传入不同窗口 → 应被快照窗口（5）覆盖
+    other_window = engine.settle(order, _question(), snapshot=snap, window=8)
+
+    assert base.to_dict() == tampered.to_dict()
+    assert base.to_dict() == other_window.to_dict()
+    assert other_window.exit_day == base.exit_day
+
+
+def test_settle_result_independent_of_live_fee_config() -> None:
+    """红线④：即使**当前费率配置**完全不同，历史结算结果也不变（费率族已冻结）。"""
+    from app.config import Settings
+
+    repo = _repo()
+    order, snap = _freeze_full(repo, window=5)
+    low = SettlementEngine(
+        repo, trade_engine=TradeEngine(repo), config=Settings(commission_rate=2.5e-4, slippage_rate=5e-4)
+    )
+    high = SettlementEngine(
+        repo,
+        trade_engine=TradeEngine(repo),
+        config=Settings(commission_rate=0.5, slippage_rate=0.5, settle_window=99),
+    )
+    assert low.settle(order, _question(), snapshot=snap).to_dict() == high.settle(
+        order, _question(), snapshot=snap
+    ).to_dict()
+

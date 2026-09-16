@@ -3,7 +3,7 @@ PY := .venv/bin/python
 PIP := .venv/bin/pip
 BIN := .venv/bin
 
-.PHONY: help venv install init sync run test lint fmt health clean
+.PHONY: help venv install init sync run test lint fmt health backup clean
 
 help:
 	@echo "复盘 · 可用命令："
@@ -16,6 +16,7 @@ help:
 	@echo "  make lint     运行 ruff + mypy"
 	@echo "  make fmt      ruff 自动格式化"
 	@echo "  make health   跑一次数据健康检查"
+	@echo "  make backup   备份训练数据 app.duckdb 并做恢复验证（FR-8.7）"
 
 venv:
 	$(PYTHON) -m venv .venv || python3 -m venv .venv
@@ -45,6 +46,9 @@ fmt:
 
 health:
 	cd backend && ../$(PY) -c "from app.data.sync.health_check import run_health_check_cli; run_health_check_cli()"
+
+backup:
+	cd backend && ../$(PY) -m scripts.backup
 
 clean:
 	find . -type d -name __pycache__ -prune -exec rm -rf {} +

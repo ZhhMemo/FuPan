@@ -104,15 +104,23 @@ def place_order(payload: OrderRequest, username: str = Depends(get_current_user)
     except Exception:  # noqa: BLE001 - 结算窗口解析失败不阻断下单
         exit_day = day
 
+    # 成交日（默认 T+1）；快照冻结覆盖费率族 + 结算窗口 + 成交时点 + 下单后账户（FR-4.6 / 红线④）
+    fill_day = fill.fill_day or day
     freezer = SnapshotFreezer(repo)
     snap = freezer.freeze_for_order(
         {"order_id": order_id, "price": fill.price, "dt": fill.dt},
         code=code,
-        fill_day=day,
+        fill_day=fill_day,
         exit_day=exit_day,
-        fee_version=settings.fee_version,
+        fee_version=engine.cost_model.fee_version,
         fill_price=fill.price,
         start_day=pd.Timestamp(rec["start_date"]).date(),
+        cost_model=engine.cost_model,
+        window=window,
+        account=account,
+        fill_price_source=engine.fill_price_source,
+        decision_day=day,
+        fill_ts=fill.fill_ts,
     )
 
     judge_advice: str | None = None

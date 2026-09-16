@@ -47,6 +47,25 @@ def test_rounding_half_up() -> None:
     assert limit_prices(10.0, "sh.600000") == (11.0, 9.0)
 
 
+def test_half_cent_boundary_uses_decimal() -> None:
+    """**B 缺陷回归**：半分位必须进位到分（Decimal HALF_UP），不得因浮点少 1 分。
+
+    真实反例（已被行情证伪）：sz.300104 2013-03-28，前收 27.65 → 跌停 27.65×0.9=24.885 → 24.89
+    （当日最低价即 24.89）；浮点 ``27.65 * 0.9 = 24.884999…`` 会错误得到 24.88。
+    """
+    from app.data.models import limit_prices_of
+
+    up, down = limit_prices(27.65, "sh.600000")
+    assert up == 30.42  # 27.65 × 1.1 = 30.415 → 30.42
+    assert down == 24.89  # 27.65 × 0.9 = 24.885 → 24.89（**不是** 24.88）
+    # 浮点路线会少 1 分（记录 pitfall，证明必须走 limit_prices_of）
+    assert round_to_cent(27.65 * 0.9) == 24.88
+    assert down != round_to_cent(27.65 * 0.9)
+    # 唯一实现直接可用
+    assert limit_prices_of(27.65, 0.10) == (30.42, 24.89)
+
+
+
 def test_build_limit_frame_uses_prev_close() -> None:
     """涨跌停基于前收盘；首行无前收被剔除。"""
     df = pd.DataFrame(

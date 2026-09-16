@@ -23,6 +23,8 @@ htmlcov/
 data/raw/
 data/clean/
 data/app/
+backups/
+data/backups/
 *.log
 
 # ── 环境与密钥 ──
@@ -40,3 +42,7 @@ frontend/.vite/
 .DS_Store
 .idea/
 .vscode/
+
+# ── 测试/临时产物 ──
+.tmp_pytest/
+.tmp_head/
