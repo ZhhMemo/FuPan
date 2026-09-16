@@ -16,6 +16,9 @@ import duckdb
 # ══════════════════════════════════════════════════════════════
 MARKET_DDL: list[str] = [
     # 证券基础信息：时点标的池的前提（红线⑥）
+    # 注：is_st 由「证券名称匹配（含 ST/*ST）」得到，仅存**最新快照**，历史不可靠——
+    #     故 ST 股 ±5% 规则在 M0/M1 不实现；M2 建时点标的池时应改用
+    #     query_all_stock(day=...) 的当日名称快照重做（详见 models.Stock docstring / Q1）。
     """
     CREATE TABLE IF NOT EXISTS dim_stock (
       code VARCHAR PRIMARY KEY,
@@ -24,7 +27,7 @@ MARKET_DDL: list[str] = [
       delist_date DATE,
       board VARCHAR,
       industry VARCHAR,
-      is_st BOOLEAN,
+      is_st BOOLEAN,  -- 名称匹配，历史不可靠；见上方注释（M2 改用当日名称快照）
       updated_at TIMESTAMP
     )
     """,

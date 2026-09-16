@@ -161,6 +161,35 @@ class Repository:
         ).fetchone()
         return None if row is None or row[0] is None else float(row[0])
 
+    def get_last_tradable(self, code: str, on_or_before: date | str | None = None) -> pd.Series | None:
+        """返回该证券**最后一个可交易日**的行情行（不复权）。
+
+        口径（NA3 实测结论，**必须用 ``is_trade`` 过滤**）：
+        ``WHERE is_trade ORDER BY date DESC LIMIT 1``——
+        退市日当天 ``is_trade=False`` 且无成交量，**不可成交**；
+        若用 ``MAX(date)`` 会错误地取到「退市当天不可交易的占位行」。
+        退市平仓必须用本方法定位最后一个可成交日。
+
+        Args:
+            code: 证券代码。
+            on_or_before: 只考虑不晚于该日期的行（可选）。
+
+        Returns:
+            行情行（Series）；无数据返回 ``None``。
+        """
+        con = self._mgr.get_read(MARKET)
+        sql = (
+            "SELECT code, date, open, high, low, close, volume, amount, adj_factor, is_trade "
+            "FROM fact_daily WHERE code = ? AND is_trade"
+        )
+        params: list[Any] = [code]
+        if on_or_before is not None:
+            sql += " AND date <= ?"
+            params.append(_iso(on_or_before))
+        sql += " ORDER BY date DESC LIMIT 1"
+        df = con.execute(sql, params).fetchdf()
+        return None if df.empty else df.iloc[0]
+
     # ══════════════════════ 读：维表 ══════════════════════
 
     def get_calendar(self, start: date | str | None = None, end: date | str | None = None) -> pd.DataFrame:
@@ -344,6 +373,31 @@ class Repository:
         """写入涨跌停价。"""
         return self._write_upsert(MARKET, "dim_limit", LIMIT_COLUMNS, df)
 
+    def delete_limit(
+        self,
+        codes: Sequence[str],
+        start: date | str | None = None,
+        end: date | str | None = None,
+    ) -> int:
+        """删除给定证券（可选日期区间）的涨跌停价，返回删除行数。
+
+        用于**全量重算**前清除陈旧行（例如按 Q4 分段后，1996-12-16 之前不应再有涨跌停行）。
+        """
+        if not codes:
+            return 0
+        placeholders = ", ".join(["?"] * len(codes))
+        sql = f"DELETE FROM dim_limit WHERE code IN ({placeholders})"
+        params: list[Any] = list(codes)
+        if start is not None:
+            sql += " AND date >= ?"
+            params.append(_iso(start))
+        if end is not None:
+            sql += " AND date <= ?"
+            params.append(_iso(end))
+        with self._mgr.acquire_write(MARKET) as con:
+            row = con.execute(sql, params).fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
     def upsert_index_daily(self, df: pd.DataFrame) -> int:
         """写入指数日线。"""
         return self._write_upsert(MARKET, "dim_index_daily", INDEX_COLUMNS, df)
@@ -402,6 +456,87 @@ class Repository:
         if stock is None:
             raise NotFound(f"证券不存在：{code}")
         return stock
+
+    # ══════════════════════ 订单 / 结算（app 库）══════════════════════
+
+    def insert_order(self, row: dict[str, Any]) -> None:
+        """写入订单（含 ``params_snapshot``，红线④）。"""
+        cols = [
+            "order_id",
+            "question_id",
+            "session_id",
+            "dt",
+            "side",
+            "shares",
+            "price",
+            "params_snapshot",
+            "knowledge_mode",
+            "viewed_knowledge",
+            "judge_verdict",
+            "judge_advice",
+            "created_at",
+        ]
+        values = [row.get(c) for c in cols]
+        placeholders = ", ".join(["?"] * len(cols))
+        with self._mgr.acquire_write(APP) as con:
+            con.execute(
+                f"INSERT OR REPLACE INTO fact_order ({', '.join(cols)}) VALUES ({placeholders})",
+                values,
+            )
+
+    def list_orders(self, question_id: str) -> list[dict[str, Any]]:
+        """按时间升序返回某题目的全部订单。"""
+        con = self._mgr.get_read(APP)
+        cur = con.execute("SELECT * FROM fact_order WHERE question_id = ? ORDER BY dt", [question_id])
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, r, strict=False)) for r in cur.fetchall()]
+
+    def get_latest_order(self, question_id: str) -> dict[str, Any] | None:
+        """返回某题目最近一笔订单。"""
+        orders = self.list_orders(question_id)
+        return orders[-1] if orders else None
+
+    def upsert_settlement(self, row: dict[str, Any]) -> None:
+        """写入结算结果（冻结）。"""
+        cols = [
+            "order_id",
+            "account_return",
+            "stock_return",
+            "benchmark_return",
+            "alpha",
+            "opp_cost",
+            "max_dd",
+            "hold_all_return",
+            "fee_detail",
+            "created_at",
+        ]
+        values = [row.get(c) for c in cols]
+        placeholders = ", ".join(["?"] * len(cols))
+        with self._mgr.acquire_write(APP) as con:
+            con.execute(
+                f"INSERT OR REPLACE INTO fact_settlement ({', '.join(cols)}) VALUES ({placeholders})",
+                values,
+            )
+
+    def get_settlement(self, order_id: str) -> dict[str, Any] | None:
+        """按订单号查询结算结果。"""
+        con = self._mgr.get_read(APP)
+        cur = con.execute("SELECT * FROM fact_settlement WHERE order_id = ?", [order_id])
+        cols = [c[0] for c in cur.description]
+        row = cur.fetchone()
+        return None if row is None else dict(zip(cols, row, strict=False))
+
+    def get_settlement_by_question(self, question_id: str) -> dict[str, Any] | None:
+        """查询某题目最近一笔订单的结算结果（经 fact_order 关联）。"""
+        con = self._mgr.get_read(APP)
+        cur = con.execute(
+            "SELECT s.* FROM fact_settlement s JOIN fact_order o ON s.order_id = o.order_id "
+            "WHERE o.question_id = ? ORDER BY o.dt DESC LIMIT 1",
+            [question_id],
+        )
+        cols = [c[0] for c in cur.description]
+        row = cur.fetchone()
+        return None if row is None else dict(zip(cols, row, strict=False))
 
 
 def _row_to_stock(row: Sequence[Any]) -> Stock:

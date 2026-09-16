@@ -65,6 +65,9 @@ class Settings(BaseSettings):
     sync_hour: int = 21
     sync_minute: int = 0
 
+    # ── 结算 ──
+    settle_window: int = 20  # 决策点后观察 N 个交易日再结算（默认 20）
+
     # ── 数据源 ──
     full_history_start: str = "1990-12-19"
     baostock_reconnect_retries: int = 3
@@ -72,6 +75,20 @@ class Settings(BaseSettings):
 
     # ── 认证（M1）──
     secret_key: str = "change-me-in-production"
+    admin_username: str = "admin"  # 单账号引导（生产请改）
+    admin_password: str = "fupan@2024"  # 初始密码（首启引导；生产务必修改/经环境变量覆盖）
+    session_ttl_hours: int = 72  # 会话有效期（小时）
+    login_max_attempts: int = 5  # 连续失败阈值
+    login_lock_seconds: int = 300  # 触发锁定后的冷却秒数
+    force_https: bool = False  # 生产置 True：强制 HTTPS 跳转 + HSTS
+    security_headers: bool = True  # 是否注入 CSP 等安全响应头（N3：CSRF/CSP 生效）
+    cors_origins: list[str] = Field(
+        default_factory=lambda: [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:4173",
+        ]
+    )
 
     # ── LLM（M2）──
     llm_api_key: str = ""

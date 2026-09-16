@@ -37,7 +37,9 @@ BOARD_STAR = "star"  # 科创板
 BOARD_BSE = "bse"  # 北交所
 BOARD_OTHER = "other"
 
-# 各板块日内涨跌幅限制（对齐验收：±10% / ±20% / ±30%）
+# 各板块**最新**日内涨跌幅限制（对齐验收：±10% / ±20% / ±30%）。
+# 注意：真实规则随时间变化，**必须按日期分段**（见下方 regime 常量与 ``limit_pct_of``）；
+# 本字典仅作「无日期上下文」时的兜底，不代表历史任意一天。
 BOARD_LIMIT_PCT: dict[str, float] = {
     BOARD_MAIN: 0.10,
     BOARD_GEM: 0.20,
@@ -45,6 +47,33 @@ BOARD_LIMIT_PCT: dict[str, float] = {
     BOARD_BSE: 0.30,
     BOARD_OTHER: 0.10,
 }
+
+# ── 涨跌幅制度分段（历史正确性，Q4 修正）──
+# 主板 ±10%：自 1996-12-16「A 股统一涨跌停板制度」生效起；此前无宽幅一致涨跌停。
+MARKET_LIMIT_REGIME_START: date = date(1996, 12, 16)
+# 创业板（sz.30x）：2020-08-24 注册制改革，涨跌幅由 ±10% 放宽至 ±20%；此前为 ±10%。
+GEM_LIMIT_20PCT_START: date = date(2020, 8, 24)
+# 科创板（sh.688/689）：2019-07-22 开板即 ±20%。
+STAR_LIMIT_20PCT_START: date = date(2019, 7, 22)
+# 北交所（bj.）：2021-11-15 开市即 ±30%（前身新三板精选层亦为 ±30%）。
+BSE_LIMIT_30PCT_START: date = date(2021, 11, 15)
+
+
+def _coerce_day(day: date | datetime | str | None) -> date | None:
+    """把 ``date`` / ``datetime`` / ISO 字符串归一化为 ``date``；``None`` 原样返回。"""
+    if day is None:
+        return None
+    if isinstance(day, datetime):
+        return day.date()
+    if isinstance(day, date):
+        return day
+    text = str(day).strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
 
 
 def board_of(code: str) -> str:
@@ -66,9 +95,36 @@ def board_of(code: str) -> str:
     return BOARD_OTHER
 
 
-def limit_pct_of(code: str) -> float:
-    """返回该证券所属板块的涨跌幅限制比例。"""
-    return BOARD_LIMIT_PCT.get(board_of(code), 0.10)
+def limit_pct_of(code: str, day: date | datetime | str | None = None) -> float | None:
+    """返回该证券在 ``day`` 当日的涨跌幅限制比例（**按制度分段**，Q4 修正）。
+
+    分段规则（历史正确性）：
+    - **主板**：``day >= 1996-12-16`` 为 ±10%；此前**无**统一涨跌停 → 返回 ``None``。
+    - **创业板** ``sz.30x``：``day >= 2020-08-24`` 为 ±20%，此前为 ±10%。
+    - **科创板** ``sh.688/689``：``day >= 2019-07-22`` 起为 ±20%（开板即 20%）。
+    - **北交所** ``bj.``：±30%。
+
+    Args:
+        code: 证券代码。
+        day: 目标日期；``None`` 表示「无日期上下文」，按**最新**规则返回（不做分段）。
+
+    Returns:
+        涨跌幅比例（如 ``0.10``）；``day`` 明确早于制度生效日时返回 ``None``
+        （表示当日无该档涨跌停，调用方应视作「无涨跌停限制」）。
+    """
+    d = _coerce_day(day)
+    if d is not None and d < MARKET_LIMIT_REGIME_START:
+        return None
+    board = board_of(code)
+    if board == BOARD_BSE:
+        return 0.30
+    if board == BOARD_STAR:
+        return 0.20
+    if board == BOARD_GEM:
+        if d is not None and d < GEM_LIMIT_20PCT_START:
+            return 0.10
+        return 0.20
+    return 0.10
 
 
 def index_board_of(index_code: str) -> str:
@@ -95,7 +151,15 @@ def round_to_cent(value: float | Decimal | None) -> float | None:
 # ══════════════════ 基础信息 ══════════════════
 @dataclass(slots=True)
 class Stock:
-    """证券基础信息（时点标的池的前提，红线⑥）。"""
+    """证券基础信息（时点标的池的前提，红线⑥）。
+
+    已知局限（Q1，M0/M1 不改逻辑）：
+        ``is_st`` 由**证券名称匹配**（含 ``ST`` / ``*ST``）得到，**不可靠**——
+        历史上 ST 前缀会随时间变化（摘帽/戴帽），而 ``dim_stock`` 只存**最新快照**，
+        无法还原历史某日的 ST 状态。故日内 ±5%（ST 股）规则在 M0/M1 **不实现**，
+        并且已通过「标的池排除 ST + 排除上市不足 60 个交易日」规避多数相关场景。
+        **M2 建时点标的池时应改用 ``query_all_stock(day=...)`` 的当日名称快照重做。**
+    """
 
     code: str
     name: str = ""
@@ -103,7 +167,7 @@ class Stock:
     delist_date: date | None = None
     board: str = BOARD_OTHER
     industry: str = ""
-    is_st: bool = False
+    is_st: bool = False  # 名称匹配得到，历史不可靠；见类 docstring（M2 改用当日名称快照）
 
     @property
     def listed(self) -> bool:
@@ -194,7 +258,7 @@ class InitialPosition:
     cost_date: date | None = None
 
     def to_json(self) -> str:
-        d = {"shares": self.shares, "avg_cost": self.avg_cost}
+        d: dict[str, Any] = {"shares": self.shares, "avg_cost": self.avg_cost}
         d["cost_date"] = self.cost_date.isoformat() if self.cost_date else None
         return json.dumps(d, ensure_ascii=False)
 
@@ -233,7 +297,11 @@ class Order:
 
 @dataclass(slots=True)
 class Settlement:
-    """结算结果（账户视角；**不判对错**）。"""
+    """结算结果（账户视角；**不判对错**）。
+
+    说明（M1）：``account_return`` 等指标均为**账户视角**，无 success/fail 语义；
+    额外字段（``entry_price`` 起）用于前端展示账户结果，None/默认不改变既有契约。
+    """
 
     order_id: str
     account_return: float = 0.0
@@ -243,6 +311,19 @@ class Settlement:
     opp_cost: float = 0.0
     max_dd: float = 0.0
     hold_all_return: float = 0.0
+    # ── M1 扩展（展示用；不参与"对错"判定）──
+    entry_price: float = 0.0
+    exit_price: float = 0.0
+    exit_day: date | None = None
+    hold_days: int = 0
+    delisted: bool = False  # 是否因退市在最后可交易日平仓
+    fee_version: str = ""
+    notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["exit_day"] = self.exit_day.isoformat() if self.exit_day else None
+        return d
 
 
 @dataclass(slots=True)
@@ -331,6 +412,10 @@ __all__ = [
     "BOARD_BSE",
     "BOARD_OTHER",
     "BOARD_LIMIT_PCT",
+    "MARKET_LIMIT_REGIME_START",
+    "GEM_LIMIT_20PCT_START",
+    "STAR_LIMIT_20PCT_START",
+    "BSE_LIMIT_30PCT_START",
     "board_of",
     "limit_pct_of",
     "round_to_cent",

@@ -104,7 +104,8 @@ class DuckDBManager:
         effective_timeout = self._config.lock_timeout if timeout is None else timeout
         acquired = False
         try:
-            acquired = lock.acquire(timeout=effective_timeout)
+            lock.acquire(timeout=effective_timeout)
+            acquired = True
         except Timeout:
             acquired = False
         if not acquired:
