@@ -12,7 +12,8 @@ from datetime import date, timedelta
 
 import pandas as pd
 
-from app.config import Settings, settings as default_settings
+from app.config import Settings
+from app.config import settings as default_settings
 from app.core.logging import get_logger
 from app.core.timeutil import now_bj, parse_date, today_bj
 from app.data.models import SyncResult

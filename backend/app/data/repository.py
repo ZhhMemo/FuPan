@@ -218,7 +218,12 @@ class Repository:
         ).fetchone()
         if row is None:
             return None
-        return LimitPrice(code=row[0], date=pd.Timestamp(row[1]).date(), limit_up=float(row[2]), limit_down=float(row[3]))
+        return LimitPrice(
+            code=row[0],
+            date=pd.Timestamp(row[1]).date(),
+            limit_up=float(row[2]),
+            limit_down=float(row[3]),
+        )
 
     def get_dividend(
         self, code: str, start: date | str | None = None, end: date | str | None = None
@@ -294,7 +299,7 @@ class Repository:
         with self._mgr.acquire_write(APP) as con:
             con.execute(
                 "INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)",
-                [key, value, to_bj(pd.Timestamp.utcnow().to_pydatetime())],
+                [key, value, now_bj_naive()],
             )
 
     # ══════════════════════ 写（自带写锁）══════════════════════

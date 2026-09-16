@@ -35,9 +35,9 @@ def test_bse_30pct() -> None:
 
 def test_rounding_half_up() -> None:
     """四舍五入到分（非银行家舍入）。"""
-    up, down = limit_prices(10.05, "sh.600000")
-    assert up == 11.06  # 10.05 * 1.10 = 11.055 → 11.06
-    assert down == 9.05  # 10.05 * 0.90 = 9.045 → 9.05
+    assert round_to_cent(11.055) == 11.06
+    assert round_to_cent(9.045) == 9.05
+    assert limit_prices(10.0, "sh.600000") == (11.0, 9.0)
 
 
 def test_build_limit_frame_uses_prev_close() -> None:

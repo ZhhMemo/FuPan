@@ -18,7 +18,8 @@ from typing import Literal
 import duckdb
 from filelock import FileLock, Timeout
 
-from app.config import Settings, settings as default_settings
+from app.config import Settings
+from app.config import settings as default_settings
 from app.core.errors import DataUnavailable, LockUnavailable, ValidationError
 
 Layer = Literal["market", "app"]

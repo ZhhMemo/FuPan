@@ -10,7 +10,8 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Any
 
-from app.config import Settings, settings as default_settings
+from app.config import Settings
+from app.config import settings as default_settings
 from app.core.db import DuckDBManager
 from app.core.logging import get_logger
 from app.core.timeutil import now_bj, today_bj

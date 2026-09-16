@@ -69,7 +69,12 @@ select = ["E", "F", "I", "UP", "B"]
 ignore = ["B008"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 mypy_path = "backend"
 ignore_missing_imports = true
 warn_unused_ignores = false
+disallow_untyped_defs = false
+# 第三方库无类型桩，逐模块放宽（保留自身代码检查）
+[[tool.mypy.overrides]]
+module = ["pandas.*", "numpy.*", "duckdb.*", "baostock.*", "akshare.*", "apscheduler.*", "structlog.*", "filelock.*"]
+ignore_missing_imports = true

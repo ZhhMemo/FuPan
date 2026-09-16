@@ -10,12 +10,12 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 
 # ══════════════════ 复权口径 ══════════════════
-class AdjustMode(str, Enum):
+class AdjustMode(StrEnum):
     """复权口径枚举。
 
     - ``QFQ``  前复权：以区间最后一行为锚（``ratio = factor / factor_last``）
